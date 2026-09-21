@@ -10,6 +10,7 @@
 - **Phase 4 — data lifecycle + diff-awareness + native export.** Monthly sink rotation (`trajectories_YYYY_MM.jsonl`), `git diff --unified=3` capture (200-line clamp), `/harvest export dpo` slash command that streams every sink into a HuggingFace conversational DPO file under `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`, top-3 flaw-category telemetry in `/harvest status`.
 - **Phase 5 — Trajectory Distillation (Thrashing Detection).** When the worker spends 6+ tool calls in a single turn and repeatedly edits the same files before producing a clean compile, the extension fires a background distillation call (does NOT pause the user). K3 is asked to write the optimal single-turn response that achieves the same result; the rejected text (the messy multi-turn thrash) and the K3-distilled chosen text are saved as a DPO pair with `trigger_reason: "thrashing_distillation"`.
 - **Phase 6 — Semantic Quality Audits.** `/harvest review <feedback>` slash command. The user types feedback (e.g. "you forgot to hoist the drawer state to ViewModel"); the extension captures slice + active files, sends them to the Verifier (Staff Engineer prompt mode) which returns a diagnosis + steering instructions, prunes the flawed turn via `navigateTree`, and injects a `[SEMANTIC REVIEW ALERTS]` steering message. On clean resolution, the DPO pair is written with `trigger_reason: "semantic_review"` and the original human feedback preserved in `human_feedback`.
+- **Phase 7 — Zero-Shot Success Mining (SFT Golden Data).** Passive capture of *flawless* trajectories. When the worker completes a task in 1–2 turns with no compile failures and no audit in flight, the extension silently extracts the user prompt + active files + git diff + the worker's successful completion and writes them to a separate sink `<cwd>/.pi/harvest/sft_golden_YYYY_MM.jsonl`. **Zero verifier LLM calls.** Convert to a standard Hugging Face `SFTTrainer`-compatible file with `/harvest export sft`. This is the *positive* training signal that complements all the DPO `rejected_completion`s.
 
 ## TUI widget
 
@@ -228,6 +229,69 @@ tests/
 └── smoke.js        Integration test — mocked pi runtime + mocked verifier HTTP, exercises audit/splice/resolve and /harvest status + /harvest audit + /harvest export dpo
 ```
 
+## Phase 7: Zero-Shot Success Mining
+
+The DPO pipeline captures *preference* — the rejected 6-turn thrash vs the K3-distilled 1-turn fix. Phase 7 captures the *positive* end of that spectrum: when the worker already nails it on the first try. No preference pair, no `rejected_completion`, no `k3_audit` — just a clean `(prompt, answer)` golden example.
+
+### Trigger
+
+In `tool_result`, after every clean bash tool result, fire `harvestGoldenSFT()` only when **all** hold:
+
+1. `compilerFailStreak === 0` (no recent failures in the current run).
+2. `state === "idle"` (no audit resolution in flight — the failing criterion protection).
+3. `assistantTurnsSinceUserInput <= HARVEST_SFT_TURN_LIMIT` (default 2 — got it in 1 or 2 tries).
+4. `turnCounter - lastGoldenSftTurn >= 2` (debounce so the same successful task isn't recaptured on every subsequent tool result).
+
+When all four hold, the extension synchronously extracts the immediate prompt, snapshots active files at 300-line / 12 KB clamp, captures the `git diff --unified=3` (clamped to 200 lines), grabs the latest assistant text, and appends one JSONL line to `.pi/harvest/sft_golden_YYYY_MM.jsonl`.
+
+A notify `Golden SFT Captured! -> ...` flashes in the TUI. **Zero verifier LLM calls** are made.
+
+### Schema (`GoldenSFTRecord`)
+
+```json
+{
+ "session_id": "uuid-v7",
+ "timestamp": "ISO-8601",
+ "worker_model": "provider:model-id",
+ "domain_tags": ["rust"],
+ "immediate_prompt": "the original user task",
+ "active_files": [{ "path": "src/main.rs", "content": "fn main() {}" }],
+ "git_diff_summary": "diff --unified=3 (200-line clamp)",
+ "chosen_completion": "the worker's successful generation"
+}
+```
+
+### Export
+
+```
+/harvest export sft
+```
+
+Streams every `sft_golden_*.jsonl` file line-by-line into:
+
+```
+<cwd>/.pi/harvest/exports/sft_dataset_YYYY_MM_DD.jsonl
+```
+
+Each output line is in the standard Hugging Face conversational SFT shape consumable by `trl.SFTTrainer`:
+
+```json
+{ "messages": [
+  { "role": "user", "content": "<immediate_prompt + git_diff + active_files>" },
+  { "role": "assistant", "content": "<chosen_completion>" }
+] }
+```
+
+### Tuning
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HARVEST_SFT_TURN_LIMIT` | `2` | Max consecutive assistant turns for capture. Set to `0` to disable. |
+
+### Why this complements DPO
+
+A dataset balanced 50/50 between DPO pairs (mistakes + corrections) and SFT goldens (clean examples) gives a downstream fine-tune both the **negative** signal (what to avoid) and the **positive** signal (what to imitate). The worker model's actual style — domain choices, comment density, error-handling patterns — is most faithful in the goldens because nothing was rejected and nothing was steered.
+
 ## Roadmap
 
 - **Phase 1** ✅ — scaffolding, hooks, status widget, publishing pipeline.
@@ -236,7 +300,8 @@ tests/
 - **Phase 4** ✅ — monthly rotation, git diffs, HF DPO exporter, telemetry aggregation.
 - **Phase 5** ✅ — trajectory distillation (thrashing detection).
 - **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
-- **Phase 7** — multi-verifier consensus, streaming upload to S3/OSS.
+- **Phase 7** ✅ — zero-shot success mining (SFT Golden Data).
+- **Phase 8** — multi-verifier consensus, streaming upload to S3/OSS.
 
 ## Phase 6: `/harvest review <feedback>` in detail
 

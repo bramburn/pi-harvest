@@ -194,7 +194,6 @@ export function writeTrajectoryRecord(
  const dir = join(cwd, ".pi", "harvest");
  mkdirSync(dir, { recursive: true });
  const filePath = currentSinkPath(cwd, now);
- mkdirSync(dir, { recursive: true });
  const line = JSON.stringify(record) + "\n";
  appendFileSync(filePath, line, { encoding: "utf8" });
  return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };

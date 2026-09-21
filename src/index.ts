@@ -1,5 +1,5 @@
 /**
- * pi-harvest — Phase 1 + Phase 2 + Phase 3 + Phase 4.
+ * pi-harvest — Phases 1 through 7.
  *
  * Phase 1: telemetry hooks, TUI status widget, streak detection.
  * Phase 2: Neat Slice, verifier call, navigateTree+sendUserMessage splice,
@@ -8,7 +8,16 @@
  *          retries with backoff, full HarvestedTrajectoryRecord schema,
  *          /harvest status + /harvest audit slash commands.
  * Phase 4: monthly log rotation, git diff capture, native HF DPO
- *          exporter, telemetry aggregation (Top-N flaw categories).
+ * exporter, telemetry aggregation (Top-N flaw categories).
+ * Phase 5: Trajectory Distillation (thrashing detection). Background
+ * distillation call that compresses a 6+ tool-call thrash into a
+ * single-turn optimal response and writes it as a DPO pair.
+ * Phase 6: Semantic Quality Audits. /harvest review <feedback> slash
+ * command that pauses, audits with the Staff Engineer prompt mode,
+ * navigates back, and injects [SEMANTIC REVIEW ALERTS].
+ * Phase 7: Zero-Shot Success Mining. Passive capture of flawless
+ * 1-2 turn trajectories into sft_golden_YYYY_MM.jsonl, exportable
+ * to HF SFTTrainer shape with /harvest export sft.
  *
  * State machine (formalised):
  *   idle  --(threshold trips)-->  auditing
@@ -70,6 +79,15 @@ interface LooseToolResult {
  details?: unknown;
  content?: Array<{ type?: string; text?: string }> | string;
  isError?: boolean;
+}
+
+/**
+ * Loose shape for the TurnEndEvent payload. We only need toolResults
+ * for the thrashing detector; other fields are ignored.
+ */
+interface LooseTurnEndEvent {
+ toolResults?: LooseToolResult[];
+ [k: string]: unknown;
 }
 
 interface ExtensionAPI {
@@ -389,7 +407,7 @@ export default function (pi: ExtensionAPI): void {
  // -------------------------------------------------------------------------
 
  pi.registerCommand("harvest", {
- description: "pi-harvest controls. Subcommands: status, audit, export dpo",
+ description: "pi-harvest controls. Subcommands: status | audit | retry | review <feedback> | export [dpo|sft]",
  handler: async (args, ctx) => {
  const rawArgs = (args ?? "").trim();
  const trimmed = rawArgs.toLowerCase();
@@ -473,7 +491,7 @@ export default function (pi: ExtensionAPI): void {
  "SFT export written: " + result.path + " (" + result.count + " records, " + result.bytes + " bytes)",
  "info",
  );
- } else if (exportTarget === "dpo" || exportTarget === "") {
+ } else if (exportTarget === "dpo") {
  const result = await exportToHuggingFaceDPO({ cwd: c.cwd });
  notify(
  c,
@@ -593,6 +611,10 @@ export default function (pi: ExtensionAPI): void {
  if (state !== "idle") return; // don't capture during audit resolution
  if (turnCounter - lastGoldenSftTurn < 2) return; // debounce
  const c = ctx;
+ // Capture the turn counter at call-time so concurrent in-flight
+ // captures can't double-count if turnCounter advances while we're
+ // awaiting captureActiveFileStates.
+ const captureTurn = turnCounter;
  try {
  const branch = ctx.sessionManager.getBranch();
  const slice = extractNeatSlice(branch, ctx.cwd);
@@ -602,6 +624,9 @@ export default function (pi: ExtensionAPI): void {
  const modifiedPaths = slice.modifiedPaths;
  captureActiveFileStates(ctx.cwd, modifiedPaths).then(
  (activeFiles) => {
+ // Re-check debounce inside the .then() in case a concurrent capture
+ // already landed while we were awaiting the file capture.
+ if (captureTurn <= lastGoldenSftTurn) return;
  const record: GoldenSFTRecord = {
  session_id: ctx.sessionManager?.getSessionId?.() ?? "unknown",
  timestamp: new Date().toISOString(),
@@ -618,7 +643,7 @@ export default function (pi: ExtensionAPI): void {
  try {
  const res = appendGoldenSFT(ctx.cwd, record);
  sftCount += 1;
- lastGoldenSftTurn = turnCounter;
+ lastGoldenSftTurn = captureTurn;
  notify(c, "Golden SFT Captured! -> " + res.path + " (" + record.chosen_completion.length + " chars chosen)", "info");
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
@@ -628,6 +653,7 @@ export default function (pi: ExtensionAPI): void {
  },
  () => {
  // captureActiveFileStates rejected - skip silently, file capture isn't required.
+ if (captureTurn <= lastGoldenSftTurn) return;
  const record: GoldenSFTRecord = {
  session_id: ctx.sessionManager?.getSessionId?.() ?? "unknown",
  timestamp: new Date().toISOString(),
@@ -641,7 +667,7 @@ export default function (pi: ExtensionAPI): void {
  try {
  const res = appendGoldenSFT(ctx.cwd, record);
  sftCount += 1;
- lastGoldenSftTurn = turnCounter;
+ lastGoldenSftTurn = captureTurn;
  notify(c, "Golden SFT Captured! -> " + res.path, "info");
  } catch (err) {
  // ignore
@@ -665,7 +691,7 @@ export default function (pi: ExtensionAPI): void {
  * Non-blocking — runs the distiller in a fire-and-forget Promise so the
  * user's interactive session is never paused.
  */
- function maybeDetectThrashing(ctx: PiContext, event: any): void {
+ function maybeDetectThrashing(ctx: PiContext, event: LooseTurnEndEvent): void {
  if (distillationInFlight) return; // already running
 
  const toolResults: LooseToolResult[] = Array.isArray(event?.toolResults) ? event.toolResults : [];
@@ -740,6 +766,10 @@ export default function (pi: ExtensionAPI): void {
 
  function runReview(ctx: PiContext, humanFeedback: string): void {
  if (auditInFlight) return;
+ if (compilerFailStreak !== 0) {
+ notify(ctx, "Review skipped — worker is in an active compile failure streak (" + compilerFailStreak + "). Resolve the streak first.", "warn");
+ return;
+ }
  const c = ctx as PiContext;
  auditInFlight = (async () => {
  state = "auditing";
@@ -843,7 +873,12 @@ export default function (pi: ExtensionAPI): void {
  * reviewer doesn't supply a divergence id directly.
  */
  function entryIdBeforeMostRecentAssistant(slice: NeatSlice): string | null {
- for (let i = slice.sliceEntries.length - 1; i >= 1; i--) {
+ // Walk backward, skip trailing tool results, then return the entry
+ // immediately before the most recent assistant message. Require
+ // `i >= 2` so we never return the inception prompt (sliceEntries[0]
+ // is the user message extractNeatSlice started from); navigating to
+ // that would rewind the entire task rather than just the flawed turn.
+ for (let i = slice.sliceEntries.length - 1; i >= 2; i--) {
  const e = slice.sliceEntries[i];
  if (e.type === "message" && (e.message as { role?: string }).role === "assistant") {
  return slice.sliceEntries[i - 1].id ?? null;
@@ -1014,7 +1049,7 @@ export default function (pi: ExtensionAPI): void {
 
  // 3) Phase 5: thrashing detection. Runs after the audit/splice logic
  // so it never competes with state transitions. Non-blocking.
- maybeDetectThrashing(c, event);
+ maybeDetectThrashing(c, event as LooseTurnEndEvent);
 
  paint(c);
  });
