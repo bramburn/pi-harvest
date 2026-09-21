@@ -459,3 +459,175 @@ export async function invokeVerifier(slice: NeatSlice): Promise<VerifierAudit> {
  }
  throw new VerifierUnavailableError(env.retries + 1, lastError);
 }
+// ============================================================================
+// Reviewer (Phase 6): semantic / business-logic review triggered manually
+// via /harvest review <feedback>. The code compiled, but the human flagged
+// a missing piece of business logic. Same retry/backoff policy as the
+// error auditor.
+// ============================================================================
+
+const REVIEWER_SYSTEM_PROMPT = [
+ "You are a Staff Engineer conducting a code review.",
+ "The junior worker model generated code that compiles successfully, but the human user has flagged a semantic, logical, or architectural omission.",
+ "Review the active files against the human feedback.",
+ "Identify exactly what the model missed, and provide concrete steering instructions to implement the missing logic.",
+ "",
+ "Output strictly in JSON with exactly these fields and no others:",
+ JSON.stringify({
+ flaw_category: "string - canonical category (e.g. SemanticLogicError, MissingStateHoisting, BusinessLogicOmission)",
+ diagnosis: "string - what business logic or architecture the worker missed",
+ steering_instructions: "string - concrete instructions to satisfy the human review",
+ }, null, 2),
+ "",
+ "Return JSON only. Do not wrap it in markdown fences. Do not add prose.",
+].join("\n");
+
+export interface ReviewerResponse {
+ flaw_category: string;
+ diagnosis: string;
+ steering_instructions: string;
+}
+
+export function validateReviewerResponse(value: unknown): ReviewerResponse {
+ if (!value || typeof value !== "object" || Array.isArray(value)) {
+ throw new Error("Reviewer response is not a JSON object");
+ }
+ const obj = value as Record<string, unknown>;
+ if (typeof obj.diagnosis !== "string") {
+ throw new Error("Reviewer response: diagnosis must be a string");
+ }
+ if (typeof obj.steering_instructions !== "string") {
+ throw new Error("Reviewer response: steering_instructions must be a string");
+ }
+ if ("flaw_category" in obj && obj.flaw_category !== undefined && typeof obj.flaw_category !== "string") {
+ throw new Error("Reviewer response: flaw_category must be a string when present");
+ }
+ return {
+ flaw_category: typeof obj.flaw_category === "string" ? obj.flaw_category : "SemanticLogicError",
+ diagnosis: obj.diagnosis,
+ steering_instructions: obj.steering_instructions,
+ };
+}
+
+export function buildReviewerPayload(opts: {
+ slice: NeatSlice;
+ activeFiles: ActiveFile[];
+ humanFeedback: string;
+}): string {
+ const parts: string[] = [];
+ parts.push("=== HUMAN FEEDBACK ===");
+ parts.push(opts.humanFeedback || "(no feedback provided)");
+
+ if (opts.activeFiles.length > 0) parts.push("\n=== ACTIVE FILES (under review) ===");
+ for (const f of opts.activeFiles) {
+ if (!f || typeof f !== "object") continue;
+ const path = typeof f.path === "string" ? f.path : "?";
+ const skipped = typeof f.skipped === "string" ? f.skipped : undefined;
+ if (skipped) {
+ parts.push("--- " + path + " ---");
+ parts.push("(skipped: " + skipped + ")");
+ continue;
+ }
+ const content = typeof f.content === "string" ? f.content : "";
+ parts.push("--- " + path + " ---");
+ parts.push(content || "(empty)");
+ }
+ if (opts.activeFiles.length === 0) parts.push("\n=== ACTIVE FILES ===\n(no active files captured)");
+
+ if (opts.slice.inceptionPrompt) {
+ parts.push("\n=== ORIGINAL TASK ===");
+ parts.push(opts.slice.inceptionPrompt);
+ }
+ if (opts.slice.compilerError) {
+ parts.push("\n=== RECENT COMPILER / TOOL OUTPUT (clamped) ===");
+ parts.push(opts.slice.compilerError);
+ }
+
+ return enforcePayloadSizeInternal(parts.join("\n\n"), 64 * 1024);
+}
+
+async function reviewerAttemptOnce(
+ opts: { baseUrl: string; apiKey: string; model: string; timeoutMs: number },
+ payload: { slice: NeatSlice; activeFiles: ActiveFile[]; humanFeedback: string },
+ attempt: number,
+): Promise<ReviewerResponse> {
+ const userContent = buildReviewerPayload(payload);
+ const body = {
+ model: opts.model,
+ messages: [
+ { role: "system", content: REVIEWER_SYSTEM_PROMPT },
+ { role: "user", content: userContent },
+ ],
+ response_format: { type: "json_object" },
+ temperature: 0,
+ };
+
+ const controller = new AbortController();
+ const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+
+ let res: Response;
+ try {
+ res = await fetch(opts.baseUrl + "/chat/completions", {
+ method: "POST",
+ headers: { "Content-Type": "application/json", Authorization: "Bearer " + opts.apiKey },
+ body: JSON.stringify(body),
+ signal: controller.signal,
+ });
+ } catch (err) {
+ clearTimeout(timer);
+ const e = err as Error;
+ throw new Error(
+ "attempt " + attempt + ": " + (e.name === "AbortError" ? "timed out after " + opts.timeoutMs + "ms" : "network error: " + e.message),
+ );
+ }
+ clearTimeout(timer);
+
+ if (res.status === 429 || res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
+ throw new RetryableHttpError(res.status, res.statusText);
+ }
+ if (!res.ok) {
+ const text = await res.text().catch(() => "");
+ throw new Error("attempt " + attempt + ": HTTP " + res.status + ": " + text.slice(0, 500));
+ }
+
+ const parsed = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+ const content = parsed?.choices?.[0]?.message?.content;
+ if (typeof content !== "string" || content.length === 0) {
+ throw new Error("attempt " + attempt + ": empty content");
+ }
+ const cleaned = stripJsonFences(content);
+ let json: unknown;
+ try {
+ json = JSON.parse(cleaned);
+ } catch (err) {
+ throw new Error("attempt " + attempt + ": JSON.parse failed: " + (err as Error).message);
+ }
+ return validateReviewerResponse(json);
+}
+
+export async function invokeReviewer(opts: {
+ cwd: string;
+ slice: NeatSlice;
+ activeFiles: ActiveFile[];
+ humanFeedback: string;
+}): Promise<ReviewerResponse> {
+ const env = readEnv();
+ const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
+ const backoffMs = [1000, 2000];
+ let lastError: unknown = null;
+
+ for (let attempt = 0; attempt <= env.retries; attempt++) {
+ try {
+ return await reviewerAttemptOnce(envOpts, opts, attempt + 1);
+ } catch (err) {
+ lastError = err;
+ const isRetryable =
+ err instanceof RetryableHttpError ||
+ (err instanceof Error && /timed out|network error|JSON\.parse failed/.test(err.message));
+ if (!isRetryable || attempt >= env.retries) break;
+ const delay = backoffMs[Math.min(attempt, backoffMs.length - 1)];
+ await sleep(delay);
+ }
+ }
+ throw new VerifierUnavailableError(env.retries + 1, lastError);
+}

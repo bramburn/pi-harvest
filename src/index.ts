@@ -25,7 +25,7 @@
 
 import { writeDpoEntry, getSinkStats, currentSinkPath } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
-import { invokeVerifier, invokeDistiller } from "./verifier.js";
+import { invokeVerifier, invokeDistiller, invokeReviewer } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
 import { exportToHuggingFaceDPO } from "./exporter.js";
@@ -124,7 +124,7 @@ const THRASHING_THRESHOLD = Number(process.env.HARVEST_THRASHING_THRESHOLD ?? "6
 const STATUS_KEY = "harvester";
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
-type TriggerReason = "compiler_streak" | "periodic_turn" | "manual";
+type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
 
 // ---------------------------------------------------------------------------
 // Extension entry
@@ -139,6 +139,7 @@ export default function (pi: ExtensionAPI): void {
  let lastAuditedTurn = 0; // turn counter at the most recent audit trigger
 
  let lastAudit: VerifierAudit | null = null;
+ let lastReviewFeedback: string | null = null;
  let lastSlice: NeatSlice | null = null;
  let lastActiveFiles: ActiveFile[] = [];
  let lastRejected: string = "";
@@ -317,6 +318,7 @@ export default function (pi: ExtensionAPI): void {
  divergenceEntryId: lastDivergenceEntryId,
  activeFiles: lastActiveFiles,
  gitDiffSummary: lastGitDiffSummary,
+ humanFeedback: lastReviewFeedback,
  });
  harvestCount += 1;
  notify(ctx, "Harvested DPO pair → " + result.path + " (" + result.bytes + " bytes)", "info");
@@ -335,6 +337,7 @@ export default function (pi: ExtensionAPI): void {
  lastRejected = "";
  lastDivergenceEntryId = null;
  lastGitDiffSummary = null;
+ lastReviewFeedback = null;
  lastAuditedTurn = turnCounter;
  paint(ctx);
  return true;
@@ -347,7 +350,8 @@ export default function (pi: ExtensionAPI): void {
  pi.registerCommand("harvest", {
  description: "pi-harvest controls. Subcommands: status, audit, export dpo",
  handler: async (args, ctx) => {
- const trimmed = ((args ?? "").trim().toLowerCase());
+ const rawArgs = (args ?? "").trim();
+ const trimmed = rawArgs.toLowerCase();
  const c = ctx as PiContext;
 
  // Subcommand routing.
@@ -358,6 +362,26 @@ export default function (pi: ExtensionAPI): void {
  }
  notify(c, "Manual audit requested", "info");
  runAudit(c, "manual");
+ return;
+ }
+
+ if (trimmed === "review" || trimmed.startsWith("review ")) {
+ const feedback = rawArgs.replace(/^review\s*/i, "").trim();
+ if (!feedback) {
+ notify(c, "Usage: /harvest review <your feedback>", "warn");
+ return;
+ }
+ if (auditInFlight) {
+ notify(c, "Another audit is in flight; try again in a moment", "warn");
+ return;
+ }
+ if (state === "auditing" || state === "awaiting_resolution") {
+ notify(c, "Harvester busy (state=" + state + "); review skipped", "warn");
+ return;
+ }
+ const preview = feedback.length > 60 ? feedback.slice(0, 57) + "..." : feedback;
+ notify(c, "Semantic review requested: " + preview, "info");
+ runReview(c, feedback);
  return;
  }
 
@@ -535,6 +559,128 @@ export default function (pi: ExtensionAPI): void {
  * caught and reported via notify so a flaky verifier never crashes the
  * session.
  */
+// =========================================================================-
+ // Phase 6: Semantic review run. Triggered by /harvest review <feedback>.
+ // Calls invokeReviewer with the current slice + active files + the human
+ // feedback string. On success: navigateTree to the entry just before the
+ // flawed code was generated, then sendUserMessage a [SEMANTIC REVIEW ALERTS]
+ // block, and transition state to awaiting_resolution so the existing
+ // maybeResolveAndHarvest() path picks up the resolution.
+ // =========================================================================-
+
+ function runReview(ctx: PiContext, humanFeedback: string): void {
+ if (auditInFlight) return;
+ const c = ctx as PiContext;
+ auditInFlight = (async () => {
+ state = "auditing";
+ lastTriggerReason = "semantic_review";
+ lastAuditedTurn = turnCounter;
+ paint(c);
+
+ try {
+ const branch = ctx.sessionManager.getBranch();
+ const slice = extractNeatSlice(branch, c.cwd);
+ let activeFiles: ActiveFile[] = [];
+ try {
+ activeFiles = await captureActiveFileStates(c.cwd, slice.modifiedPaths);
+ } catch {
+ activeFiles = [];
+ }
+
+ const review = await invokeReviewer({ cwd: c.cwd, slice, activeFiles, humanFeedback });
+
+ // Stage the audit so the existing maybeResolveAndHarvest() can pick it up.
+ lastAudit = {
+ inferred_subtask: slice.inceptionPrompt || "(no inception prompt)",
+ divergence_detected: true,
+ flaw_category: review.flaw_category || "SemanticLogicError",
+ root_cause: review.diagnosis,
+ discard_advice: "",
+ steering_instructions: review.steering_instructions,
+ domain_tags: inferDomainTags(slice.modifiedPaths),
+ };
+ lastSlice = slice;
+ lastActiveFiles = activeFiles;
+ lastRejected = slice.failedCode || extractLatestAssistant(branch);
+ lastDivergenceEntryId = null;
+ lastGitDiffSummary = extractGitDiff(c.cwd);
+ lastReviewFeedback = humanFeedback;
+ state = "awaiting_resolution";
+
+ notify(
+ c,
+ "Review complete - flaw=" + review.flaw_category + "; steering worker to implement feedback",
+ "info",
+ );
+
+ // Context surgery: navigateTree to the entry just before the flawed code,
+ // then inject the steering message. If navigateTree fails (or no target
+ // can be found), we still inject the steering message - the spec's
+ // explicit contract is that the steering message lands.
+ const targetId = entryIdBeforeMostRecentAssistant(slice);
+ if (targetId) {
+ try {
+ const nav = await (pi as ExtensionAPI).navigateTree(targetId, {
+ summarize: true,
+ customInstructions: review.steering_instructions,
+ });
+ if (nav.cancelled) {
+ notify(c, "Review splice cancelled by user", "warn");
+ }
+ } catch (err) {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "Review navigateTree failed: " + msg, "warn");
+ }
+ }
+
+ const steeringBody =
+ "[SEMANTIC REVIEW ALERTS]\n" +
+ "Human Feedback: " + humanFeedback + "\n" +
+ "Diagnosis: " + review.diagnosis + "\n" +
+ "Action Required: " + review.steering_instructions;
+ try {
+ (pi as ExtensionAPI).sendUserMessage(steeringBody, { deliverAs: "steer" });
+ } catch (err) {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "Review sendUserMessage failed: " + msg, "warn");
+ }
+ } catch (err) {
+ const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (isUnavailable) {
+ notify(c, "Review aborted - verifier unavailable; unlocking state", "warning");
+ } else {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "Review failed: " + msg + " (unlocking state)", "warn");
+ }
+ state = "idle";
+ lastAudit = null;
+ lastSlice = null;
+ lastActiveFiles = [];
+ lastRejected = "";
+ lastDivergenceEntryId = null;
+ lastGitDiffSummary = null;
+ lastReviewFeedback = null;
+ } finally {
+ auditInFlight = null;
+ paint(c);
+ }
+ })();
+ }
+
+ /**
+ * Find the entry just before the most recent assistant message in the
+ * slice. Used as the navigateTree target for semantic reviews when the
+ * reviewer doesn't supply a divergence id directly.
+ */
+ function entryIdBeforeMostRecentAssistant(slice: NeatSlice): string | null {
+ for (let i = slice.sliceEntries.length - 1; i >= 1; i--) {
+ const e = slice.sliceEntries[i];
+ if (e.type === "message" && (e.message as { role?: string }).role === "assistant") {
+ return slice.sliceEntries[i - 1].id ?? null;
+ }
+ }
+ return null;
+ }
  function triggerDistillation(ctx: PiContext): void {
  const c = ctx as PiContext;
  const branch = ctx.sessionManager.getBranch();

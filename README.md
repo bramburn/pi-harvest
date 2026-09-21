@@ -9,6 +9,7 @@
 - **Phase 3 — production hardening.** Active-file capture with 300-line / 12 KB clamps, domain taxonomy tagging, verifier retries with exponential backoff (1 s → 2 s), full `HarvestedTrajectoryRecord` schema, `/harvest status` + `/harvest audit` slash commands.
 - **Phase 4 — data lifecycle + diff-awareness + native export.** Monthly sink rotation (`trajectories_YYYY_MM.jsonl`), `git diff --unified=3` capture (200-line clamp), `/harvest export dpo` slash command that streams every sink into a HuggingFace conversational DPO file under `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`, top-3 flaw-category telemetry in `/harvest status`.
 - **Phase 5 — Trajectory Distillation (Thrashing Detection).** When the worker spends 6+ tool calls in a single turn and repeatedly edits the same files before producing a clean compile, the extension fires a background distillation call (does NOT pause the user). K3 is asked to write the optimal single-turn response that achieves the same result; the rejected text (the messy multi-turn thrash) and the K3-distilled chosen text are saved as a DPO pair with `trigger_reason: "thrashing_distillation"`.
+- **Phase 6 — Semantic Quality Audits.** `/harvest review <feedback>` slash command. The user types feedback (e.g. "you forgot to hoist the drawer state to ViewModel"); the extension captures slice + active files, sends them to the Verifier (Staff Engineer prompt mode) which returns a diagnosis + steering instructions, prunes the flawed turn via `navigateTree`, and injects a `[SEMANTIC REVIEW ALERTS]` steering message. On clean resolution, the DPO pair is written with `trigger_reason: "semantic_review"` and the original human feedback preserved in `human_feedback`.
 
 ## TUI widget
 
@@ -233,8 +234,40 @@ tests/
 - **Phase 2** ✅ — Neat Slice, out-of-band Verifier call, splice, DPO sink.
 - **Phase 3** ✅ — workspace capture, domain taxonomy, retry/backoff, full DPO/SFT schema, slash commands.
 - **Phase 4** ✅ — monthly rotation, git diffs, HF DPO exporter, telemetry aggregation.
-- **Phase 5** ✅ — trajectory distillation: thrashing detection + background K3 distillation + DPO pair with `trigger_reason: "thrashing_distillation"`.
-- **Phase 6** — multi-verifier consensus, streaming upload to S3/OSS.
+- **Phase 5** ✅ — trajectory distillation (thrashing detection).
+- **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
+- **Phase 7** — multi-verifier consensus, streaming upload to S3/OSS.
+
+## Phase 6: `/harvest review <feedback>` in detail
+
+When the code compiles cleanly but misses something the human cares about (business logic, a missing handler, an architectural concern), the user types:
+
+```
+/harvest review you forgot to hoist the drawer state to the ViewModel
+```
+
+The extension:
+
+1. Captures the active slice + active files just like the Phase 3 auditor.
+2. POSTs to the Verifier with the human's feedback string prominent at the top of the user payload.
+3. The Verifier (Staff Engineer prompt mode) returns `{ flaw_category, diagnosis, steering_instructions }`.
+4. `pi.navigateTree(...)` rewinds the session to the entry just before the flawed code (collapsing it into a compaction summary).
+5. `pi.sendUserMessage("[SEMANTIC REVIEW ALERTS]\nHuman Feedback: ...\nDiagnosis: ...\nAction Required: ...", { deliverAs: "steer" })` injects the steering directive.
+6. State transitions to `awaiting_resolution`. When the worker produces clean output on its next turn, `maybeResolveAndHarvest()` writes a DPO record with `trigger_reason: "semantic_review"` and the human's feedback preserved in `human_feedback`.
+
+### Reviewer prompt mode
+
+The Verifier system prompt instructs the model as a Staff Engineer conducting a code review. Strict response schema:
+
+```json
+{ "flaw_category": "string", "diagnosis": "string", "steering_instructions": "string" }
+```
+
+Same retry/backoff/fence-stripping/timeout policy as the other Verifier modes. Same env vars: `VERIFIER_BASE_URL`, `VERIFIER_API_KEY`, `VERIFIER_MODEL`.
+
+## Phase 5: thrashing detection in detail
+
+The Phase 3 audit only fires on **compile failures**. Phase 5 catches **inefficiency**: when the worker succeeds after a long sequence of edits to the same files, that's a high-value training signal — "the worker could have done this in one shot."
 
 ## Phase 5: thrashing detection in detail
 

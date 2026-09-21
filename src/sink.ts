@@ -39,7 +39,7 @@ export interface SinkResult {
  bytes: number;
 }
 
-export type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation";
+export type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
 
 /**
  * Filename pattern for rotated sinks. Matched by listSinkFiles().
@@ -95,6 +95,7 @@ export function buildTrajectoryRecord(args: {
  divergenceEntryId: string | null;
  domainTags: string[];
  gitDiffSummary: string | null;
+ humanFeedback?: string | null;
  ctx: SinkContext;
 }): HarvestedTrajectoryRecord {
  return {
@@ -116,6 +117,7 @@ export function buildTrajectoryRecord(args: {
  },
  rejected_completion: args.rejectedCompletion,
  chosen_completion: args.chosenCompletion,
+ human_feedback: args.humanFeedback ?? null,
  };
 }
 
@@ -153,6 +155,7 @@ export function writeDpoEntry(args: {
  divergenceEntryId?: string | null;
  activeFiles?: ActiveFile[];
  gitDiffSummary?: string | null;
+ humanFeedback?: string | null;
 }): SinkResult {
  const record = buildTrajectoryRecord({
  audit: args.audit,
@@ -166,6 +169,7 @@ export function writeDpoEntry(args: {
  divergenceEntryId: args.divergenceEntryId ?? null,
  domainTags: args.domainTags ?? args.audit.domain_tags ?? [],
  gitDiffSummary: args.gitDiffSummary ?? null,
+ humanFeedback: args.humanFeedback ?? null,
  ctx: args.ctx,
  });
  return writeTrajectoryRecord(record, args.ctx.cwd);

@@ -312,3 +312,100 @@ test("invokeDistiller: strips markdown fences before parsing", async () => {
  server.close();
  }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 6: Reviewer
+// ---------------------------------------------------------------------------
+
+const VALID_REVIEW = {
+ flaw_category: "SemanticLogicError",
+ diagnosis: "Forgot to hoist drawer state to ViewModel.",
+ steering_instructions: "Move the local state into a ViewModel property.",
+};
+
+test("validateReviewerResponse: accepts the spec's primary schema (diagnosis + steering)", () => {
+ const minimal = { diagnosis: "X", steering_instructions: "Y" };
+ const out = verifier.validateReviewerResponse(minimal);
+ assert.equal(out.flaw_category, "SemanticLogicError"); // default
+ assert.equal(out.diagnosis, "X");
+});
+
+test("validateReviewerResponse: preserves a supplied flaw_category", () => {
+ const out = verifier.validateReviewerResponse(VALID_REVIEW);
+ assert.equal(out.flaw_category, "SemanticLogicError");
+});
+
+test("validateReviewerResponse: rejects missing diagnosis", () => {
+ const bad = { steering_instructions: "Y" };
+ assert.throws(() => verifier.validateReviewerResponse(bad), /diagnosis/);
+});
+
+test("validateReviewerResponse: rejects missing steering_instructions", () => {
+ const bad = { diagnosis: "X" };
+ assert.throws(() => verifier.validateReviewerResponse(bad), /steering_instructions/);
+});
+
+test("validateReviewerResponse: rejects wrong types", () => {
+ assert.throws(() => verifier.validateReviewerResponse(null), /not a JSON object/);
+ assert.throws(() => verifier.validateReviewerResponse({ diagnosis: 1, steering_instructions: "y" }), /diagnosis must be a string/);
+ assert.throws(() => verifier.validateReviewerResponse({ diagnosis: "x", steering_instructions: 2 }), /steering_instructions must be a string/);
+});
+
+test("buildReviewerPayload: includes HUMAN FEEDBACK and ACTIVE FILES sections", () => {
+ const out = verifier.buildReviewerPayload({
+ slice: { ...FAKE_SLICE, inceptionPrompt: "build drawer" },
+ activeFiles: [{ path: "drawer.ts", content: "const x = 1;", truncated: false }],
+ humanFeedback: "you forgot state hoisting",
+ });
+ assert.match(out, /HUMAN FEEDBACK/);
+ assert.match(out, /you forgot state hoisting/);
+ assert.match(out, /ACTIVE FILES/);
+ assert.match(out, /drawer\.ts/);
+ assert.match(out, /ORIGINAL TASK/);
+ assert.match(out, /build drawer/);
+});
+
+test("invokeReviewer: parses a clean JSON response", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ const { server, baseUrl } = await startMock((_req, res) => {
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(VALID_REVIEW) } }] }));
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ const out = await verifier.invokeReviewer({
+ cwd: "/tmp",
+ slice: FAKE_SLICE as any,
+ activeFiles: [],
+ humanFeedback: "review this",
+ });
+ assert.equal(out.diagnosis, "Forgot to hoist drawer state to ViewModel.");
+ assert.match(out.steering_instructions, /ViewModel/);
+ } finally {
+ server.close();
+ }
+});
+
+test("invokeReviewer: retries on 429 and eventually throws VerifierUnavailableError", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ process.env.HARVEST_MAX_RETRIES = "1";
+ let hits = 0;
+ const { server, baseUrl } = await startMock((_req, res) => {
+ hits++;
+ res.writeHead(429, { "Content-Type": "text/plain" });
+ res.end("rate limited");
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ await assert.rejects(
+ () => verifier.invokeReviewer({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [], humanFeedback: "x" }),
+ (err: unknown) => err instanceof VerifierUnavailableError,
+ );
+ assert.equal(hits, 2, "1 initial + 1 retry");
+ } finally {
+ delete process.env.HARVEST_MAX_RETRIES;
+ server.close();
+ }
+});
