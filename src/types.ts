@@ -119,7 +119,7 @@ export interface HarvestedTrajectoryRecord {
  timestamp: string;
  worker_model: string;
  verifier_model: string;
- trigger_reason: "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
+ trigger_reason: "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review" | "architectural_opinion";
  domain_tags: string[];
  immediate_prompt: string;
  active_files: ActiveFile[];

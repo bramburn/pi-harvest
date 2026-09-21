@@ -229,6 +229,48 @@ tests/
 └── smoke.js        Integration test — mocked pi runtime + mocked verifier HTTP, exercises audit/splice/resolve and /harvest status + /harvest audit + /harvest export dpo
 ```
 
+## Phase 8: `/harvest opinion [query]` in detail
+
+Phase 6 (semantic review) targets *broken* code; Phase 8 targets *working* code that could be elevated to expert-grade. When the user types `/harvest opinion [optional query]`, the extension captures the active slice and files, posts to the Verifier in **Principal Software Architect** prompt mode, and injects a forward-looking advisory steer — **without pruning the trajectory** so the pre-refactor working code becomes the `rejected_completion` baseline and the post-refactor code becomes the `chosen_completion`.
+
+This produces an **optimization DPO pair** — distinct from the broken-code DPO pairs — teaching the worker model how to elevate "okay" code to "expert" code.
+
+### Trigger
+
+```
+/harvest opinion is this safe from SQL injection?
+/harvest opinion is the worker pool properly bounded?
+/harvest opinion         (general best-practice review)
+```
+
+Same `state === "idle"` and `compilerFailStreak === 0` gates as Phase 6.
+
+### Verifier prompt mode
+
+System prompt instructs the model as a Principal Software Architect conducting a proactive review of working code. Strict response schema:
+
+```json
+{
+ "opinion_summary": "string - 2-4 sentence diagnosis of the architectural smell",
+ "refactor_instructions": "string - concrete refactor steps",
+ "flaw_category": "string - SuboptimalArchitecture | PerformanceBottleneck | SecurityRisk | ThreadingHazard | ErrorHandlingGap | ApiMisuse | TypeErosion | NamingConventionViolation | IdiomaticStructureViolation | MissingObservability"
+}
+```
+
+Same retry/backoff/fence-stripping/timeout policy as the other Verifier modes. Same env vars: `VERIFIER_BASE_URL`, `VERIFIER_API_KEY`, `VERIFIER_MODEL`.
+
+### Critical behavioural difference from Phase 6
+
+| | Phase 6 (review) | Phase 8 (opinion) |
+|---|---|---|
+| When fired | User says code has a bug | User wants refactor advice |
+| `navigateTree` | **YES** (rewinds flawed turn) | **NO** (preserves trajectory) |
+| `rejected_completion` | broken code | working-but-suboptimal code |
+| `chosen_completion` | worker's fix | worker's refactor |
+| Steer prefix | `[SEMANTIC REVIEW ALERTS]` | `[ARCHITECTURAL OPINION]` |
+| `flaw_category` | `SemanticLogicError` etc. | `SuboptimalArchitecture` etc. |
+| `trigger_reason` | `semantic_review` | `architectural_opinion` |
+
 ## Phase 7: Zero-Shot Success Mining
 
 The DPO pipeline captures *preference* — the rejected 6-turn thrash vs the K3-distilled 1-turn fix. Phase 7 captures the *positive* end of that spectrum: when the worker already nails it on the first try. No preference pair, no `rejected_completion`, no `k3_audit` — just a clean `(prompt, answer)` golden example.
@@ -301,7 +343,7 @@ A dataset balanced 50/50 between DPO pairs (mistakes + corrections) and SFT gold
 - **Phase 5** ✅ — trajectory distillation (thrashing detection).
 - **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
 - **Phase 7** ✅ — zero-shot success mining (SFT Golden Data).
-- **Phase 8** — multi-verifier consensus, streaming upload to S3/OSS.
+- **Phase 8** ✅ — proactive architectural opinions via `/harvest opinion [query]`.
 
 ## Phase 6: `/harvest review <feedback>` in detail
 
@@ -385,7 +427,9 @@ Same retry/backoff policy as the error auditor (`HARVEST_MAX_RETRIES`, 1 s → 2
 - **Phase 3** ✅ — workspace capture, domain taxonomy, retry/backoff, full DPO/SFT schema, slash commands.
 - **Phase 4** ✅ — monthly rotation, git diffs, HF DPO exporter, telemetry aggregation.
 - **Phase 5** ✅ — trajectory distillation.
-- **Phase 6** — multi-verifier consensus, streaming upload to S3/OSS.
+- **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
+- **Phase 7** ✅ — zero-shot success mining (SFT Golden Data).
+- **Phase 8** ✅ — proactive architectural opinions via `/harvest opinion [query]`.
 
 ## License
 

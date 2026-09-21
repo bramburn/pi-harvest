@@ -631,3 +631,179 @@ export async function invokeReviewer(opts: {
  }
  throw new VerifierUnavailableError(env.retries + 1, lastError);
 }
+// ============================================================================
+// Opinion (Phase 8): proactive architectural review of WORKING code.
+// Triggered manually via /harvest opinion [optional query]. Unlike an
+// audit (which prunes the broken turn), an opinion is a forward-looking
+// advisory steer — the trajectory is preserved because the working code
+// is the "rejected" baseline we want to compare the refactor against.
+// ============================================================================
+
+const OPINION_SYSTEM_PROMPT = [
+ "You are a Principal Software Architect proactively reviewing working code.",
+ "The code compiles and the tests pass — but the human user has requested an architectural opinion, optimization, security review, or general improvement suggestions.",
+ "Analyze the active files and trajectory. Provide concrete, actionable refactoring advice that elevates the working code to expert-grade.",
+ "",
+ "Output strictly in JSON with exactly these fields and no others:",
+ JSON.stringify({
+ opinion_summary: "string - 2-4 sentence diagnosis of the architectural smell or improvement opportunity",
+ refactor_instructions: "string - concrete refactor steps the worker should apply (code shapes, library choices, patterns)",
+ flaw_category: "string - one of {SuboptimalArchitecture, PerformanceBottleneck, SecurityRisk, ThreadingHazard, ErrorHandlingGap, ApiMisuse, TypeErosion, NamingConventionViolation, IdiomaticStructureViolation, MissingObservability}",
+ }, null, 2),
+ "",
+ "Return JSON only. Do not wrap it in markdown fences. Do not add prose.",
+].join("\n");
+
+export interface OpinionResponse {
+ opinion_summary: string;
+ refactor_instructions: string;
+ flaw_category: string;
+}
+
+export function validateOpinionResponse(value: unknown): OpinionResponse {
+ if (!value || typeof value !== "object" || Array.isArray(value)) {
+ throw new Error("Opinion response is not a JSON object");
+ }
+ const obj = value as Record<string, unknown>;
+ if (typeof obj.opinion_summary !== "string") {
+ throw new Error("Opinion response: opinion_summary must be a string");
+ }
+ if (typeof obj.refactor_instructions !== "string") {
+ throw new Error("Opinion response: refactor_instructions must be a string");
+ }
+ if (typeof obj.flaw_category !== "string" || obj.flaw_category.length === 0) {
+ throw new Error("Opinion response: flaw_category must be a non-empty string");
+ }
+ return {
+ opinion_summary: obj.opinion_summary,
+ refactor_instructions: obj.refactor_instructions,
+ flaw_category: obj.flaw_category,
+ };
+}
+
+export function buildOpinionPayload(opts: {
+ slice: NeatSlice;
+ activeFiles: ActiveFile[];
+ optionalQuery: string;
+}): string {
+ const parts: string[] = [];
+ parts.push("=== REVIEW REQUEST ===");
+ if (opts.optionalQuery && opts.optionalQuery.trim().length > 0) {
+ parts.push("The human user specifically asks: " + opts.optionalQuery);
+ } else {
+ parts.push("The human user has requested a general architectural / optimization review.");
+ }
+
+ if (opts.activeFiles.length > 0) parts.push("\n=== ACTIVE FILES (under review) ===");
+ for (const f of opts.activeFiles) {
+ if (!f || typeof f !== "object") continue;
+ const path = typeof f.path === "string" ? f.path : "?";
+ const skipped = typeof f.skipped === "string" ? f.skipped : undefined;
+ if (skipped) {
+ parts.push("--- " + path + " ---");
+ parts.push("(skipped: " + skipped + ")");
+ continue;
+ }
+ const content = typeof f.content === "string" ? f.content : "";
+ parts.push("--- " + path + " ---");
+ parts.push(content || "(empty)");
+ }
+ if (opts.activeFiles.length === 0) parts.push("\n=== ACTIVE FILES ===\n(no active files captured)");
+
+ if (opts.slice.inceptionPrompt) {
+ parts.push("\n=== ORIGINAL TASK ===");
+ parts.push(opts.slice.inceptionPrompt);
+ }
+ if (opts.slice.failedCode) {
+ parts.push("\n=== CURRENT CODE (under review) ===");
+ parts.push(opts.slice.failedCode);
+ }
+
+ return enforcePayloadSizeInternal(parts.join("\n\n"), 64 * 1024);
+}
+
+async function opinionAttemptOnce(
+ opts: { baseUrl: string; apiKey: string; model: string; timeoutMs: number },
+ payload: { slice: NeatSlice; activeFiles: ActiveFile[]; optionalQuery: string },
+ attempt: number,
+): Promise<OpinionResponse> {
+ const userContent = buildOpinionPayload(payload);
+ const body = {
+ model: opts.model,
+ messages: [
+ { role: "system", content: OPINION_SYSTEM_PROMPT },
+ { role: "user", content: userContent },
+ ],
+ response_format: { type: "json_object" },
+ temperature: 0,
+ };
+
+ const controller = new AbortController();
+ const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+
+ let res: Response;
+ try {
+ res = await fetch(opts.baseUrl + "/chat/completions", {
+ method: "POST",
+ headers: { "Content-Type": "application/json", Authorization: "Bearer " + opts.apiKey },
+ body: JSON.stringify(body),
+ signal: controller.signal,
+ });
+ } catch (err) {
+ clearTimeout(timer);
+ const e = err as Error;
+ throw new Error(
+ "attempt " + attempt + ": " + (e.name === "AbortError" ? "timed out after " + opts.timeoutMs + "ms" : "network error: " + e.message),
+ );
+ }
+ clearTimeout(timer);
+
+ if (res.status === 429 || res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
+ throw new RetryableHttpError(res.status, res.statusText);
+ }
+ if (!res.ok) {
+ const text = await res.text().catch(() => "");
+ throw new Error("attempt " + attempt + ": HTTP " + res.status + ": " + text.slice(0, 500));
+ }
+
+ const parsed = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+ const content = parsed?.choices?.[0]?.message?.content;
+ if (typeof content !== "string" || content.length === 0) {
+ throw new Error("attempt " + attempt + ": empty content");
+ }
+ const cleaned = stripJsonFences(content);
+ let json: unknown;
+ try {
+ json = JSON.parse(cleaned);
+ } catch (err) {
+ throw new Error("attempt " + attempt + ": JSON.parse failed: " + (err as Error).message);
+ }
+ return validateOpinionResponse(json);
+}
+
+export async function invokeOpinion(opts: {
+ cwd: string;
+ slice: NeatSlice;
+ activeFiles: ActiveFile[];
+ optionalQuery: string;
+}): Promise<OpinionResponse> {
+ const env = readEnv();
+ const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
+ const backoffMs = [1000, 2000];
+ let lastError: unknown = null;
+
+ for (let attempt = 0; attempt <= env.retries; attempt++) {
+ try {
+ return await opinionAttemptOnce(envOpts, opts, attempt + 1);
+ } catch (err) {
+ lastError = err;
+ const isRetryable =
+ err instanceof RetryableHttpError ||
+ (err instanceof Error && /timed out|network error|JSON\.parse failed/.test(err.message));
+ if (!isRetryable || attempt >= env.retries) break;
+ const delay = backoffMs[Math.min(attempt, backoffMs.length - 1)];
+ await sleep(delay);
+ }
+ }
+ throw new VerifierUnavailableError(env.retries + 1, lastError);
+}

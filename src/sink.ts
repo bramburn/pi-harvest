@@ -40,7 +40,7 @@ export interface SinkResult {
  bytes: number;
 }
 
-export type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
+export type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review" | "architectural_opinion";
 
 /**
  * Filename pattern for rotated sinks. Matched by listSinkFiles().

@@ -16,6 +16,11 @@
  * command that pauses, audits with the Staff Engineer prompt mode,
  * navigates back, and injects [SEMANTIC REVIEW ALERTS].
  * Phase 7: Zero-Shot Success Mining. Passive capture of flawless
+ * Phase 8: Proactive Architectural Opinions. /harvest opinion [query] slash
+ * command that fetches a Principal Software Architect review of WORKING
+ * code and injects a forward-looking [ARCHITECTURAL OPINION] advisory steer
+ * WITHOUT navigatingTree — the pre-refactor working code becomes the
+ * rejected_completion, the post-refactor code becomes the chosen_completion.
  * 1-2 turn trajectories into sft_golden_YYYY_MM.jsonl, exportable
  * to HF SFTTrainer shape with /harvest export sft.
  *
@@ -34,7 +39,7 @@
 
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
-import { invokeVerifier, invokeDistiller, invokeReviewer } from "./verifier.js";
+import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
 import { exportToHuggingFaceDPO, exportToHuggingFaceSFT } from "./exporter.js";
@@ -144,14 +149,14 @@ const SFT_TURN_LIMIT = Number(process.env.HARVEST_SFT_TURN_LIMIT ?? "2");
 const STATUS_KEY = "harvester";
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
-type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
+type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review" | "architectural_opinion";
 
 /**
  * Last-error record. Surfaced in /harvest status and the next notify,
  * and full-stack-logged to console.error so pi's debug log captures it.
  */
 interface LastError {
- source: "audit" | "review" | "distillation";
+ source: "audit" | "review" | "distillation" | "opinion";
  message: string;
  ts: string;
 }
@@ -170,6 +175,7 @@ export default function (pi: ExtensionAPI): void {
 
  let lastAudit: VerifierAudit | null = null;
  let lastReviewFeedback: string | null = null;
+ let lastOpinionQuery: string | null = null;
  let lastError: LastError | null = null;
  // Phase 7: SFT Golden Data capture
  let assistantTurnsSinceUserInput = 0; // for zero-shot detection
@@ -375,7 +381,7 @@ export default function (pi: ExtensionAPI): void {
  divergenceEntryId: lastDivergenceEntryId,
  activeFiles: lastActiveFiles,
  gitDiffSummary: lastGitDiffSummary,
- humanFeedback: lastReviewFeedback,
+ humanFeedback: lastReviewFeedback || lastOpinionQuery,
  });
  harvestCount += 1;
  notify(ctx, "Harvested DPO pair → " + result.path + " (" + result.bytes + " bytes)", "info");
@@ -396,6 +402,7 @@ export default function (pi: ExtensionAPI): void {
  lastDivergenceEntryId = null;
  lastGitDiffSummary = null;
  lastReviewFeedback = null;
+ lastOpinionQuery = null;
  lastError = null; // successful resolution
  lastAuditedTurn = turnCounter;
  paint(ctx);
@@ -478,6 +485,26 @@ export default function (pi: ExtensionAPI): void {
  const preview = feedback.length > 60 ? feedback.slice(0, 57) + "..." : feedback;
  notify(c, "Semantic review requested: " + preview, "info");
  runReview(c, feedback);
+ return;
+ }
+
+ if (trimmed === "opinion" || trimmed.startsWith("opinion ")) {
+ const optionalQuery = rawArgs.replace(/^opinion\s*/i, "").trim();
+ if (auditInFlight) {
+ notify(c, "Another audit is in flight; try again in a moment", "warn");
+ return;
+ }
+ if (state === "auditing" || state === "awaiting_resolution") {
+ notify(c, "Harvester busy (state=" + state + "); opinion skipped", "warn");
+ return;
+ }
+ if (compilerFailStreak !== 0) {
+ notify(c, "Opinion skipped — worker is in an active compile failure streak (" + compilerFailStreak + ").", "warn");
+ return;
+ }
+ const preview = optionalQuery.length > 60 ? optionalQuery.slice(0, 57) + "..." : optionalQuery;
+ notify(c, "Architectural opinion requested: " + (preview || "(general review)"), "info");
+ runOpinion(c, optionalQuery);
  return;
  }
 
@@ -885,6 +912,100 @@ export default function (pi: ExtensionAPI): void {
  }
  }
  return null;
+ }
+
+ /**
+ * Phase 8: Proactive architectural opinion. Triggered by
+ * /harvest opinion [optional query].
+ *
+ * CRITICAL: unlike semantic_review (Phase 6), this path does NOT call
+ * pi.navigateTree. The code under review is working, so the trajectory
+ * is preserved — the pre-refactor code becomes the `rejected_completion`
+ * and the post-refactor code becomes the `chosen_completion`.
+ */
+ function runOpinion(ctx: PiContext, optionalQuery: string): void {
+ if (auditInFlight) return;
+ if (compilerFailStreak !== 0) {
+ notify(ctx, "Opinion skipped — worker is in an active compile failure streak (" + compilerFailStreak + "). Resolve the streak first.", "warn");
+ return;
+ }
+ const c = ctx as PiContext;
+ auditInFlight = (async () => {
+ state = "auditing";
+ lastTriggerReason = "architectural_opinion";
+ lastAuditedTurn = turnCounter;
+ paint(c);
+
+ try {
+ const branch = ctx.sessionManager.getBranch();
+ const slice = extractNeatSlice(branch, c.cwd);
+ let activeFiles: ActiveFile[] = [];
+ try {
+ activeFiles = await captureActiveFileStates(c.cwd, slice.modifiedPaths);
+ } catch {
+ activeFiles = [];
+ }
+
+ const opinion = await invokeOpinion({ cwd: c.cwd, slice, activeFiles, optionalQuery });
+
+ // Stage the audit so the existing maybeResolveAndHarvest() can pick it up.
+ lastAudit = {
+ inferred_subtask: optionalQuery || slice.inceptionPrompt || "(no task captured)",
+ divergence_detected: true,
+ flaw_category: opinion.flaw_category || "SuboptimalArchitecture",
+ root_cause: opinion.opinion_summary,
+ discard_advice: "",
+ steering_instructions: opinion.refactor_instructions,
+ domain_tags: inferDomainTags(slice.modifiedPaths),
+ };
+ lastSlice = slice;
+ lastActiveFiles = activeFiles;
+ lastRejected = slice.failedCode || extractLatestAssistant(branch);
+ lastDivergenceEntryId = null;
+ lastGitDiffSummary = extractGitDiff(c.cwd);
+ lastOpinionQuery = optionalQuery || null;
+ state = "awaiting_resolution";
+
+ notify(
+ c,
+ "Opinion ready — category=" + opinion.flaw_category + "; steering worker to refactor",
+ "info",
+ );
+
+ // NO navigateTree here — the pre-refactor working code is the rejected
+ // baseline. We only inject the forward-looking advisory steer.
+ const steeringBody =
+ "[ARCHITECTURAL OPINION]\n" +
+ (optionalQuery ? "Query: " + optionalQuery + "\n" : "") +
+ "Analysis: " + opinion.opinion_summary + "\n" +
+ "Action Required: " + opinion.refactor_instructions;
+ try {
+ (pi as ExtensionAPI).sendUserMessage(steeringBody, { deliverAs: "steer" });
+ } catch (err) {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "Opinion sendUserMessage failed: " + msg, "warn");
+ }
+ } catch (err) {
+ const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ const cause = recordFailure(c, "opinion", err);
+ if (isUnavailable) {
+ notify(c, "Opinion aborted after retries: " + cause + ". Unlocking state; run /harvest opinion again to retry.", "warning");
+ } else {
+ notify(c, "Opinion failed: " + cause + " (unlocking state)", "warn");
+ }
+ state = "idle";
+ lastAudit = null;
+ lastSlice = null;
+ lastActiveFiles = [];
+ lastRejected = "";
+ lastDivergenceEntryId = null;
+ lastGitDiffSummary = null;
+ lastOpinionQuery = null;
+ } finally {
+ auditInFlight = null;
+ paint(c);
+ }
+ })();
  }
  function triggerDistillation(ctx: PiContext): void {
  const c = ctx as PiContext;

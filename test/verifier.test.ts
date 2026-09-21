@@ -409,3 +409,106 @@ test("invokeReviewer: retries on 429 and eventually throws VerifierUnavailableEr
  server.close();
  }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8: Opinion (proactive architectural review of working code)
+// ---------------------------------------------------------------------------
+
+const VALID_OPINION = {
+ opinion_summary: "This file opens the database connection on every request.",
+ refactor_instructions: "Hoist the connection into a module-level singleton with lazy init.",
+ flaw_category: "PerformanceBottleneck",
+};
+
+test("validateOpinionResponse: accepts a valid object", () => {
+ const out = verifier.validateOpinionResponse(VALID_OPINION);
+ assert.equal(out.opinion_summary, VALID_OPINION.opinion_summary);
+ assert.equal(out.flaw_category, "PerformanceBottleneck");
+});
+
+test("validateOpinionResponse: rejects missing opinion_summary", () => {
+ const bad = { refactor_instructions: "x", flaw_category: "y" };
+ assert.throws(() => verifier.validateOpinionResponse(bad), /opinion_summary/);
+});
+
+test("validateOpinionResponse: rejects missing refactor_instructions", () => {
+ const bad = { opinion_summary: "x", flaw_category: "y" };
+ assert.throws(() => verifier.validateOpinionResponse(bad), /refactor_instructions/);
+});
+
+test("validateOpinionResponse: rejects missing or empty flaw_category", () => {
+ assert.throws(() => verifier.validateOpinionResponse({ opinion_summary: "x", refactor_instructions: "y" }), /flaw_category/);
+ assert.throws(() => verifier.validateOpinionResponse({ opinion_summary: "x", refactor_instructions: "y", flaw_category: "" }), /flaw_category/);
+});
+
+test("validateOpinionResponse: rejects wrong types", () => {
+ assert.throws(() => verifier.validateOpinionResponse(null), /not a JSON object/);
+ assert.throws(() => verifier.validateOpinionResponse({ opinion_summary: 1, refactor_instructions: "y", flaw_category: "z" }), /opinion_summary must be a string/);
+});
+
+test("buildOpinionPayload: includes REVIEW REQUEST, optional query, and active files", () => {
+ const out = verifier.buildOpinionPayload({
+ slice: { ...FAKE_SLICE, inceptionPrompt: "build hello" },
+ activeFiles: [{ path: "main.rs", content: "fn main() {}", truncated: false }],
+ optionalQuery: "is this safe from SQL injection?",
+ });
+ assert.match(out, /REVIEW REQUEST/);
+ assert.match(out, /is this safe from SQL injection/);
+ assert.match(out, /ACTIVE FILES/);
+ assert.match(out, /main\.rs/);
+});
+
+test("buildOpinionPayload: omits the user query line when no optionalQuery", () => {
+ const out = verifier.buildOpinionPayload({
+ slice: { ...FAKE_SLICE, inceptionPrompt: "x" },
+ activeFiles: [],
+ optionalQuery: "",
+ });
+ assert.doesNotMatch(out, /specifically asks/);
+ assert.match(out, /general architectural/);
+});
+
+test("invokeOpinion: parses a clean JSON response", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ const { server, baseUrl } = await startMock((_req, res) => {
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(VALID_OPINION) } }] }));
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ const out = await verifier.invokeOpinion({
+ cwd: "/tmp",
+ slice: FAKE_SLICE as any,
+ activeFiles: [],
+ optionalQuery: "performance check",
+ });
+ assert.equal(out.flaw_category, "PerformanceBottleneck");
+ assert.match(out.refactor_instructions, /singleton/);
+ } finally {
+ server.close();
+ }
+});
+
+test("invokeOpinion: retries on 503 and eventually throws VerifierUnavailableError", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ process.env.HARVEST_MAX_RETRIES = "1";
+ let hits = 0;
+ const { server, baseUrl } = await startMock((_req, res) => {
+ hits++;
+ res.writeHead(503, { "Content-Type": "text/plain" });
+ res.end("unavailable");
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ await assert.rejects(
+ () => verifier.invokeOpinion({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [], optionalQuery: "x" }),
+ (err: unknown) => err instanceof VerifierUnavailableError,
+ );
+ assert.equal(hits, 2, "1 initial + 1 retry");
+ } finally {
+ delete process.env.HARVEST_MAX_RETRIES;
+ server.close();
+ }
+});
