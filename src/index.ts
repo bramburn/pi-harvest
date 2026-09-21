@@ -126,6 +126,16 @@ const STATUS_KEY = "harvester";
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
 type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review";
 
+/**
+ * Last-error record. Surfaced in /harvest status and the next notify,
+ * and full-stack-logged to console.error so pi's debug log captures it.
+ */
+interface LastError {
+ source: "audit" | "review" | "distillation";
+ message: string;
+ ts: string;
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry
 // ---------------------------------------------------------------------------
@@ -140,6 +150,7 @@ export default function (pi: ExtensionAPI): void {
 
  let lastAudit: VerifierAudit | null = null;
  let lastReviewFeedback: string | null = null;
+ let lastError: LastError | null = null;
  let lastSlice: NeatSlice | null = null;
  let lastActiveFiles: ActiveFile[] = [];
  let lastRejected: string = "";
@@ -184,6 +195,25 @@ export default function (pi: ExtensionAPI): void {
 
  function notify(ctx: PiContext, message: string, level: string = "info"): void {
  ctx.ui?.notify?.("[Harvester] " + message, level);
+ }
+
+ /**
+ * Capture a verifier call failure and surface the underlying cause so a
+ * user can diagnose "why did audit fail". The lastError is cleared on
+ * the next successful audit and is shown by /harvest status.
+ */
+ function recordFailure(ctx: PiContext, source: LastError["source"], err: unknown): string {
+ const msg = (err as Error)?.message ?? String(err);
+ const ts = new Date().toISOString();
+ lastError = { source, message: msg, ts };
+ // Full stack to pi's stderr/console so it lands in debug logs.
+ const stack = (err as Error)?.stack;
+ if (stack) {
+ console.error("[Harvester] " + source + " failed: " + msg + "\n" + stack);
+ } else {
+ console.error("[Harvester] " + source + " failed: " + msg);
+ }
+ return msg;
  }
 
  function workerModelId(ctx: PiContext): string {
@@ -242,6 +272,7 @@ export default function (pi: ExtensionAPI): void {
  lastDivergenceEntryId =
  typeof audit.divergence_turn_entry_id === "string" ? audit.divergence_turn_entry_id : null;
  lastGitDiffSummary = gitDiff;
+ lastError = null; // clear any prior failed audit
  state = "awaiting_resolution";
 
  notify(
@@ -259,13 +290,13 @@ export default function (pi: ExtensionAPI): void {
  await performSplice(audit, slice, pi as never, ctx as never);
  } catch (err) {
  const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ const cause = recordFailure(ctx, "audit", err);
  if (isUnavailable) {
- notify(ctx, "Audit failed, unlocking state. Continuing unsteered.", "warning");
+ notify(ctx, "Audit failed after retries: " + cause + ". Unlocking state; run /harvest audit to retry.", "warning");
  // Reset the streak so we don't loop forever on a flaky endpoint.
  compilerFailStreak = 0;
  } else {
- const msg = (err as Error)?.message ?? String(err);
- notify(ctx, "Audit failed: " + msg + " (unlocking state)", "warn");
+ notify(ctx, "Audit failed: " + cause + " (unlocking state)", "warn");
  }
  // The finally block below handles state + auditInFlight cleanup.
  } finally {
@@ -329,7 +360,8 @@ export default function (pi: ExtensionAPI): void {
 
  // CRITICAL: reset to idle and clear all cached audit state. Failing to
  // do this leaves the extension permanently stuck in awaiting_resolution
- // and blocks every future trigger.
+ // and blocks every future trigger. Also clear any prior failure so the
+ // status widget reflects the freshly-successful cycle.
  state = "idle";
  lastAudit = null;
  lastSlice = null;
@@ -338,6 +370,7 @@ export default function (pi: ExtensionAPI): void {
  lastDivergenceEntryId = null;
  lastGitDiffSummary = null;
  lastReviewFeedback = null;
+ lastError = null; // successful resolution
  lastAuditedTurn = turnCounter;
  paint(ctx);
  return true;
@@ -428,7 +461,10 @@ export default function (pi: ExtensionAPI): void {
  "B";
  const line4 = "Worker: " + workerModelId(c);
  const line5 = formatTelemetryForNotify(telemetry);
- c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n" + line5, "info");
+ const line6 = lastError
+ ? "LastError: " + lastError.source + " @ " + lastError.ts + " - " + lastError.message + " (run /harvest audit to retry)"
+ : "LastError: (none)";
+ c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n" + line5 + "\n " + line6, "info");
  paint(c);
  },
  });
@@ -646,11 +682,11 @@ export default function (pi: ExtensionAPI): void {
  }
  } catch (err) {
  const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ const cause = recordFailure(c, "review", err);
  if (isUnavailable) {
- notify(c, "Review aborted - verifier unavailable; unlocking state", "warning");
+ notify(c, "Review aborted after retries: " + cause + ". Unlocking state; run /harvest review again to retry.", "warning");
  } else {
- const msg = (err as Error)?.message ?? String(err);
- notify(c, "Review failed: " + msg + " (unlocking state)", "warn");
+ notify(c, "Review failed: " + cause + " (unlocking state)", "warn");
  }
  state = "idle";
  lastAudit = null;
@@ -723,12 +759,12 @@ export default function (pi: ExtensionAPI): void {
  notify(c, "Distilled DPO pair saved (" + distilled.distilled_chosen_completion.length + " chars chosen)", "info");
  } catch (err) {
  const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
- const msg = (err as Error)?.message ?? String(err);
+ const cause = recordFailure(c, "distillation", err);
  notify(
  c,
  isUnavailable
- ? "Distillation skipped — verifier unavailable (continuing unblocked)"
- : "Distillation failed: " + msg,
+ ? "Distillation skipped after retries: " + cause + " (continuing unblocked)"
+ : "Distillation failed: " + cause,
  "warn",
  );
  } finally {
