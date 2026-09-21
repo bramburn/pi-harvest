@@ -12,10 +12,6 @@ export interface SpliceResult {
  steeringInjected: boolean;
 }
 
-/**
- * Minimal interface we depend on from the pi host. The full ExtensionAPI
- * union is large; only the methods we actually use are typed here.
- */
 export interface SpliceContext {
  sessionManager: {
  getSessionId(): string;
@@ -27,19 +23,10 @@ export interface SpliceContext {
 }
 
 export interface SpliceHost {
- /**
- * pi.sendUserMessage(string, { deliverAs: "steer" }) — injects a user
- * message into the running agent as a steering directive.
- */
  sendUserMessage(
  content: string,
  options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
  ): void;
- /**
- * pi.navigateTree(targetId, { summarize }) — rewind to a prior entry;
- * `summarize: true` collapses the discarded branch into a compaction
- * summary so context stays bounded.
- */
  navigateTree(
  targetId: string,
  options?: {
@@ -58,30 +45,42 @@ export interface SpliceHost {
 function buildSteeringBody(audit: VerifierAudit): string {
  const lines: string[] = [];
  lines.push("[STEER:K3]");
- lines.push(`Subtask: ${audit.inferred_subtask}`);
+ lines.push("Subtask: " + audit.inferred_subtask);
  if (audit.divergence_detected) {
- lines.push(`Flaw: ${audit.flaw_category} — ${audit.root_cause}`);
- lines.push(`Fix: ${audit.steering_instructions}`);
+ lines.push("Flaw: " + audit.flaw_category + " — " + audit.root_cause);
+ lines.push("Fix: " + audit.steering_instructions);
  if (audit.discard_advice) {
- lines.push(`Discard: ${audit.discard_advice}`);
+ lines.push("Discard: " + audit.discard_advice);
  }
  } else {
- // No divergence detected — still acknowledge the audit so the worker
- // knows it was reviewed and continue without major rewrites.
- lines.push(`Status: no divergence detected by auditor`);
- lines.push(`Fix: ${audit.steering_instructions}`);
+ lines.push("Status: no divergence detected by auditor");
+ lines.push("Fix: " + audit.steering_instructions);
+ }
+ if (audit.domain_tags && audit.domain_tags.length > 0) {
+ lines.push("Domain: " + audit.domain_tags.join(", "));
  }
  return lines.join("\n");
 }
 
 /**
- * Perform the splice:
- * 1. If divergence_detected: rewind via navigateTree to the entry just
- * before the divergence, collapsing the discarded branch into a summary.
- * 2. Inject the steering message via sendUserMessage.
+ * Resolve the target entry id for navigateTree from the audit response.
  *
- * Safe to call when divergence_detected is false — the rewind is
- * skipped but steering is still injected.
+ * Phase 3 prefers `divergence_turn_entry_id` (returned by the verifier
+ * directly). Falls back to computing from `divergence_turn` for any
+ * v0.2.0 auditors still in circulation.
+ */
+function resolveDivergenceEntryId(audit: VerifierAudit, slice: NeatSlice): string | null {
+ if (typeof audit.divergence_turn_entry_id === "string" && audit.divergence_turn_entry_id.length > 0) {
+ return audit.divergence_turn_entry_id;
+ }
+ if (typeof audit.divergence_turn === "number") {
+ return entryIdForDivergenceTurn(slice, audit.divergence_turn);
+ }
+ return null;
+}
+
+/**
+ * Perform the splice.
  */
 export async function performSplice(
  audit: VerifierAudit,
@@ -96,7 +95,7 @@ export async function performSplice(
  };
 
  if (audit.divergence_detected) {
- const targetId = entryIdForDivergenceTurn(slice, audit.divergence_turn);
+ const targetId = resolveDivergenceEntryId(audit, slice);
  if (targetId) {
  try {
  const nav = await pi.navigateTree(targetId, {
@@ -108,24 +107,19 @@ export async function performSplice(
  result.navigatedToEntryId = targetId;
  }
  } catch (err) {
- // Don't fail the whole splice on a navigation error — at least
- // inject the steering message so the worker can self-correct.
  const msg = (err as Error)?.message ?? String(err);
- _ctx.ui?.notify?.(`[Harvester] navigateTree failed: ${msg}`, "warn");
+ _ctx.ui?.notify?.("[Harvester] navigateTree failed: " + msg, "warn");
  }
  }
  }
 
- // Always inject the steering message. sendUserMessage with
- // deliverAs: "steer" is the supported way to push a directive into
- // a running agent without blocking its current stream.
  try {
  const body = buildSteeringBody(audit);
  pi.sendUserMessage(body, { deliverAs: "steer" });
  result.steeringInjected = true;
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
- _ctx.ui?.notify?.(`[Harvester] sendUserMessage failed: ${msg}`, "warn");
+ _ctx.ui?.notify?.("[Harvester] sendUserMessage failed: " + msg, "warn");
  }
 
  return result;

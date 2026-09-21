@@ -1,44 +1,46 @@
 /**
- * pi-harvest — Phase 1 + Phase 2.
+ * pi-harvest — Phase 1 + Phase 2 + Phase 3.
  *
  * Phase 1:
  * - tool_result hook: case-insensitive compiler-failure scan; tracks a
  * streak count.
- * - turn_end hook: periodic (every TURN_INTERVAL turns) and emergency
- * (streak >= STREAK_THRESHOLD) triggers.
- * - TUI status widget: [Harvester] Turn: N | Streak: M | Harvests: H | State: ...
+ * - turn_end hook: periodic and emergency triggers.
+ * - TUI status widget.
  *
  * Phase 2:
- * - extractNeatSlice(): backward walk to the Inception Prompt, slice
- * from there to the current end, extract failed code + compiler error.
- * - invokeVerifier(): OpenAI-compatible POST to the Verifier env-config
- * endpoint; strict JSON schema validation; markdown-fence stripping.
- * - performSplice(): on divergence, navigateTree(...) to the last clean
- * entry (collapsing the discarded branch into a summary), then
- * sendUserMessage(...) to inject a [STEER:K3] directive.
- * - writeDpoEntry(): when the worker resolves (streak drops back to 0
- * after an audit), append a flat DPO record to
- * `<cwd>/.pi/harvest/trajectories.jsonl`.
+ * - extractNeatSlice(): backward walk to the Inception Prompt.
+ * - invokeVerifier(): OpenAI-compatible POST with strict JSON schema.
+ * - performSplice(): navigateTree (rewind) + sendUserMessage (steering).
+ * - writeDpoEntry(): append DPO record to .pi/harvest/trajectories.jsonl.
  *
- * The runtime is supplied by pi.dev when it loads this module
- * (via `pi install npm:pi-harvest`). The interfaces below are the
- * minimal surface we use, kept local so the package builds without
- * depending on pi's typings.
+ * Phase 3 additions:
+ * - captureActiveFileStates(): workspace capture with 300-line / 12KB clamp.
+ * - inferDomainTags(): local fallback for the new domain_tags schema field.
+ * - invokeVerifier() retries with exponential backoff (1s -> 2s) on 429/5xx.
+ * - VerifierUnavailableError resets compilerFailStreak on exhaustion so we
+ * never block the user's interactive session on a flaky endpoint.
+ * - /harvest status and /harvest audit slash commands.
+ * - Expanded TUI widget with explicit State indicator.
+ * - Full HarvestedTrajectoryRecord schema (active_files, compiler_error_summary,
+ * worker_model, verifier_model, trigger_reason, nested k3_audit).
  */
 
-import { writeDpoEntry } from "./sink.js";
+import { writeDpoEntry, getSinkStats, countHarvestedRecords } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
 import { invokeVerifier } from "./verifier.js";
 import { performSplice } from "./splice.js";
+import { captureActiveFileStates, inferDomainTags } from "./workspace.js";
 import type {
- SessionEntry,
+ ActiveFile,
  NeatSlice,
+ SessionEntry,
  VerifierAudit,
+ VerifierUnavailableError,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Minimal runtime interfaces — declared locally so the package builds
-// without depending on pi's typings.
+// Minimal runtime interfaces (declared locally so the package builds
+// without depending on pi's typings).
 // ---------------------------------------------------------------------------
 
 interface UiHelpers {
@@ -49,6 +51,7 @@ interface UiHelpers {
 interface PiContext {
  ui: UiHelpers;
  cwd: string;
+ model?: { id?: string; name?: string; provider?: string } | undefined;
  sessionManager: {
  getBranch(): SessionEntry[];
  getSessionId(): string;
@@ -75,10 +78,18 @@ interface ExtensionAPI {
  label?: string;
  },
  ): Promise<{ cancelled: boolean }>;
+
+ registerCommand(
+ name: string,
+ options: {
+ description?: string;
+ handler: (args: string, ctx: PiContext) => Promise<void> | void;
+ },
+ ): void;
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 constants
+// Constants
 // ---------------------------------------------------------------------------
 
 const COMPILER_FAILURE_SIGNATURES: readonly string[] = [
@@ -100,9 +111,10 @@ const STREAK_THRESHOLD = Number(process.env.HARVEST_STREAK_THRESHOLD ?? "3");
 const STATUS_KEY = "harvester";
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
+type TriggerReason = "compiler_streak" | "periodic_turn" | "manual";
 
 // ---------------------------------------------------------------------------
-// Phase 2 entry point
+// Extension entry
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
@@ -110,15 +122,30 @@ export default function (pi: ExtensionAPI): void {
  let compilerFailStreak = 0;
  let harvestCount = 0;
  let state: HarvesterState = "idle";
+ let lastTriggerReason: TriggerReason = "compiler_streak";
 
- // State cached for resolution handling.
  let lastAudit: VerifierAudit | null = null;
  let lastSlice: NeatSlice | null = null;
+ let lastActiveFiles: ActiveFile[] = [];
  let lastRejected: string = "";
+ let lastDivergenceEntryId: string | null = null;
  let auditInFlight: Promise<void> | null = null;
 
+ // -------------------------------------------------------------------------
+ // Helpers
+ // -------------------------------------------------------------------------
+
  function renderStatus(): string {
- return `[Harvester] Turn: ${turnCounter} | Streak: ${compilerFailStreak} | Harvests: ${harvestCount} | State: ${state}`;
+ return (
+ "[Harvester] Turn: " +
+ turnCounter +
+ " | Streak: " +
+ compilerFailStreak +
+ " | Harvests: " +
+ harvestCount +
+ " | State: " +
+ state
+ );
  }
 
  function paint(ctx: PiContext): void {
@@ -126,13 +153,14 @@ export default function (pi: ExtensionAPI): void {
  }
 
  function notify(ctx: PiContext, message: string, level: string = "info"): void {
- ctx.ui?.notify?.(`[Harvester] ${message}`, level);
+ ctx.ui?.notify?.("[Harvester] " + message, level);
  }
 
- /**
- * Pull the most recent assistant text from the active branch — this
- * becomes the "chosen completion" once the worker resolves.
- */
+ function workerModelId(ctx: PiContext): string {
+ if (!ctx.model) return "unknown";
+ return (ctx.model.provider ?? "") + ":" + (ctx.model.id ?? ctx.model.name ?? "unknown");
+ }
+
  function extractLatestAssistant(branch: SessionEntry[]): string {
  for (let i = branch.length - 1; i >= 0; i--) {
  const e = branch[i];
@@ -148,43 +176,65 @@ export default function (pi: ExtensionAPI): void {
 
  /**
  * Run the audit. Fire-and-forget from turn_end so we never block the
- * pi runtime on an HTTP call; the promise is tracked so we don't
- * double-fire.
+ * pi runtime on an HTTP call.
  */
- function runAudit(ctx: PiContext): void {
+ function runAudit(ctx: PiContext, triggerReason: TriggerReason): void {
  if (auditInFlight) return;
-
  auditInFlight = (async () => {
  state = "auditing";
+ lastTriggerReason = triggerReason;
  paint(ctx);
 
  try {
  const branch = ctx.sessionManager.getBranch();
- const slice = extractNeatSlice(branch);
+ const slice = extractNeatSlice(branch, ctx.cwd);
  const audit = await invokeVerifier(slice);
 
- // Cache everything we need for the eventual DPO write.
+ // Capture active files at audit time.
+ let activeFiles: ActiveFile[] = [];
+ try {
+ activeFiles = await captureActiveFileStates(ctx.cwd, slice.modifiedPaths);
+ } catch {
+ activeFiles = [];
+ }
+
  lastAudit = audit;
  lastSlice = slice;
+ lastActiveFiles = activeFiles;
  lastRejected = slice.failedCode || extractLatestAssistant(branch);
+ lastDivergenceEntryId =
+ typeof audit.divergence_turn_entry_id === "string" ? audit.divergence_turn_entry_id : null;
  state = "awaiting_resolution";
 
  notify(
  ctx,
- `Audit complete — divergence: ${audit.divergence_detected ? "yes" : "no"}${audit.divergence_detected ? ` at turn ${audit.divergence_turn}` : ""}; flaw=${audit.flaw_category}`,
+ "Audit complete — divergence: " +
+ (audit.divergence_detected ? "yes" : "no") +
+ "; flaw=" +
+ audit.flaw_category +
+ "; tags=[" +
+ (audit.domain_tags || []).join(",") +
+ "]",
  "info",
  );
 
- // Splice (navigateTree + steering).
  await performSplice(audit, slice, pi as never, ctx as never);
  } catch (err) {
+ const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (isUnavailable) {
+ notify(ctx, "Verifier endpoint unavailable. Continuing unsteered.", "warning");
+ // Reset the streak so we don't loop forever on a flaky endpoint.
+ compilerFailStreak = 0;
+ } else {
  const msg = (err as Error)?.message ?? String(err);
- notify(ctx, `Audit failed: ${msg}`, "warn");
- // Stay in idle so the next turn can retry; don't poison state.
+ notify(ctx, "Audit failed: " + msg, "warn");
+ }
  state = "idle";
  lastAudit = null;
  lastSlice = null;
+ lastActiveFiles = [];
  lastRejected = "";
+ lastDivergenceEntryId = null;
  } finally {
  auditInFlight = null;
  paint(ctx);
@@ -195,7 +245,7 @@ export default function (pi: ExtensionAPI): void {
  /**
  * If a previous audit is awaiting resolution AND the streak just
  * dropped back to 0, the worker has fixed the issue — write a DPO
- * entry and clear the awaiting flag.
+ * record and clear the awaiting flag.
  */
  function maybeResolveAndHarvest(ctx: PiContext): boolean {
  if (state !== "awaiting_resolution") return false;
@@ -205,6 +255,11 @@ export default function (pi: ExtensionAPI): void {
  const branch = ctx.sessionManager.getBranch();
  const chosen = extractLatestAssistant(branch);
 
+ const domainTags =
+ lastAudit.domain_tags && lastAudit.domain_tags.length > 0
+ ? lastAudit.domain_tags
+ : inferDomainTags(lastSlice.modifiedPaths);
+
  try {
  const result = writeDpoEntry({
  audit: lastAudit,
@@ -212,44 +267,95 @@ export default function (pi: ExtensionAPI): void {
  chosenCompletion: chosen,
  rejectedCompletion: lastRejected,
  ctx: ctx as never,
- domainTags: [],
+ domainTags,
+ workerModel: workerModelId(ctx),
+ verifierModel: process.env.VERIFIER_MODEL ?? "unknown",
+ triggerReason: lastTriggerReason,
+ divergenceEntryId: lastDivergenceEntryId,
+ activeFiles: lastActiveFiles,
  });
  harvestCount += 1;
- notify(
- ctx,
- `Harvested DPO pair → ${result.path} (${result.bytes} bytes); session=${result.path}`,
- "info",
- );
+ notify(ctx, "Harvested DPO pair → " + result.path + " (" + result.bytes + " bytes)", "info");
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
- notify(ctx, `DPO sink write failed: ${msg}`, "warn");
+ notify(ctx, "DPO sink write failed: " + msg, "warn");
  }
 
- // Reset state for the next episode.
  state = "idle";
  lastAudit = null;
  lastSlice = null;
+ lastActiveFiles = [];
  lastRejected = "";
+ lastDivergenceEntryId = null;
  paint(ctx);
  return true;
  }
+
+ // -------------------------------------------------------------------------
+ // Slash command: /harvest status | /harvest audit
+ // -------------------------------------------------------------------------
+
+ pi.registerCommand("harvest", {
+ description: "pi-harvest controls: status shows telemetry + sink stats; audit forces a manual harvest",
+ handler: async (args, ctx) => {
+ const trimmed = (args ?? "").trim().toLowerCase();
+ const c = ctx as PiContext;
+
+ if (trimmed === "audit") {
+ if (auditInFlight) {
+ notify(c, "Audit already in flight", "warn");
+ return;
+ }
+ notify(c, "Manual audit requested", "info");
+ runAudit(c, "manual");
+ return;
+ }
+
+ // Default + "status": print a summary.
+ const stats = getSinkStats(c.cwd);
+ const line1 =
+ "Status: turn=" +
+ turnCounter +
+ " streak=" +
+ compilerFailStreak +
+ " harvests=" +
+ harvestCount +
+ " state=" +
+ state;
+ const line2 =
+ "Verifier: " +
+ (process.env.VERIFIER_BASE_URL || "<unset>") +
+ " model=" +
+ (process.env.VERIFIER_MODEL || "<unset>");
+ const line3 =
+ "Sink: " +
+ stats.path +
+ " records=" +
+ stats.recordCount +
+ " size=" +
+ stats.sizeBytes +
+ "B";
+ const line4 = "Worker: " + workerModelId(c);
+ // Emit as a single multi-line notify.
+ c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4, "info");
+ paint(c);
+ },
+ });
 
  // -------------------------------------------------------------------------
  // Hooks
  // -------------------------------------------------------------------------
 
  pi.on("tool_result", (event, ctx) => {
+ const c = ctx as PiContext;
  const e = event as { toolName?: string; output?: string; stdout?: string; stderr?: string };
 
- // Only inspect bash tool output.
  const toolName = (e.toolName ?? "").toLowerCase();
  if (toolName && toolName !== "bash" && toolName !== "run_shell" && toolName !== "shell") {
- paint(ctx as PiContext);
+ paint(c);
  return;
  }
 
- // Concatenate any available output streams; lowercase before testing
- // so the parser never misses case-sensitive compiler errors.
  const raw =
  [e.output, e.stdout, e.stderr].filter((s): s is string => typeof s === "string").join("\n") || "";
  const haystack = raw.toLowerCase();
@@ -257,37 +363,35 @@ export default function (pi: ExtensionAPI): void {
  if (haystack && SIGNATURE_REGEX.test(haystack)) {
  compilerFailStreak += 1;
  } else {
- // Only reset the streak on actual clean bash output, not on empty
- // payloads (empty could mean no output, not a successful build).
- if (raw.length > 0) {
- compilerFailStreak = 0;
- }
+ if (raw.length > 0) compilerFailStreak = 0;
  }
 
- paint(ctx as PiContext);
+ paint(c);
  });
 
  pi.on("turn_end", (_event, ctx) => {
  const c = ctx as PiContext;
  turnCounter += 1;
 
- // 1) If a previous audit is awaiting resolution AND the worker just
- // produced clean bash output, write the DPO entry.
  if (maybeResolveAndHarvest(c)) {
  // already painted inside
  } else if (state === "idle") {
- // 2) Otherwise, evaluate trigger thresholds.
  const turnHit = TURN_INTERVAL > 0 && turnCounter % TURN_INTERVAL === 0;
  const streakHit = STREAK_THRESHOLD > 0 && compilerFailStreak >= STREAK_THRESHOLD;
  if (turnHit || streakHit) {
  const reason = streakHit
- ? `compiler failure streak ${compilerFailStreak} >= ${STREAK_THRESHOLD}`
- : `turn interval reached (every ${TURN_INTERVAL})`;
- notify(c, `Trajectory audit required — ${reason}`, "warn");
- runAudit(c);
+ ? "compiler failure streak " + compilerFailStreak + " >= " + STREAK_THRESHOLD
+ : "turn interval reached (every " + TURN_INTERVAL + ")";
+ notify(c, "Trajectory audit required — " + reason, "warn");
+ runAudit(c, streakHit ? "compiler_streak" : "periodic_turn");
  }
  }
 
  paint(c);
  });
 }
+
+// Re-export so consumers/tests can grab the error class.
+export { VerifierUnavailableError } from "./types.js";
+// countHarvestedRecords is useful for tests / external introspection.
+export { countHarvestedRecords } from "./sink.js";

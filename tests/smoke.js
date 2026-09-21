@@ -1,11 +1,12 @@
 /**
- * Phase 2 integration smoke test.
+ * Integration smoke test (Phase 2 + Phase 3).
  *
  * Boots the compiled extension against a fully-mocked pi runtime:
- * - simulates a 3-failure compile streak
+ * - drives a 3-failure compile streak
  * - intercepts the HTTP call to the Verifier via a local mock server
- * - drives navigateTree + sendUserMessage
- * - asserts a DPO line lands in .pi/harvest/trajectories.jsonl
+ * - asserts navigateTree + sendUserMessage fire
+ * - verifies a HarvestedTrajectoryRecord lands in .pi/harvest/trajectories.jsonl
+ * - exercises /harvest status and /harvest audit slash commands
  */
 
 const http = require("node:http");
@@ -33,11 +34,18 @@ async function startMockVerifier(responder) {
 function makePi() {
  const handlers = {};
  const calls = { sendUserMessage: [], navigateTree: [] };
+ const commands = {};
+ const notifyCalls = [];
  return {
  handlers,
  calls,
+ commands,
+ notifyCalls,
  on(event, handler) {
  handlers[event] = handler;
+ },
+ registerCommand(name, options) {
+ commands[name] = options;
  },
  sendUserMessage(content, options) {
  calls.sendUserMessage.push({ content: content, options: options });
@@ -50,6 +58,10 @@ function makePi() {
  if (handlers[event]) {
  return handlers[event](eventObj, ctx);
  }
+ },
+ _callCommand(name, args, ctx) {
+ if (!commands[name]) throw new Error("no command: " + name);
+ return commands[name].handler(args, ctx);
  },
  };
 }
@@ -80,11 +92,12 @@ async function main() {
  const audit = {
  inferred_subtask: "build hello world in rust",
  divergence_detected: true,
- divergence_turn: 3,
+ divergence_turn_entry_id: "t1",
  flaw_category: "logic_error",
  root_cause: "missing semicolon",
  discard_advice: "drop turns 2-3",
  steering_instructions: "Add `;` at end of statement.",
+ domain_tags: ["rust"],
  };
  res.writeHead(200, { "Content-Type": "application/json" });
  res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(audit) } }] }));
@@ -126,9 +139,12 @@ async function main() {
 
  const ctx = {
  cwd: cwd,
+ model: { id: "MiniMax-M3", provider: "minimax" },
  ui: {
  setStatus: function () {},
- notify: function () {},
+ notify: function (msg) {
+ pi.notifyCalls.push(msg);
+ },
  },
  sessionManager: {
  getBranch: function () {
@@ -142,7 +158,9 @@ async function main() {
 
  extension(pi);
 
- // Drive 3 failed builds in a row.
+ // -----------------------------------------------------------------------
+ // 1. Existing Phase 2 flow: 3-failure streak -> audit -> steer -> resolve
+ // -----------------------------------------------------------------------
  for (let i = 0; i < 3; i++) {
  pi._fire(
  "tool_result",
@@ -152,12 +170,10 @@ async function main() {
  }
  pi._fire("turn_end", {}, ctx);
 
- // Audit should fire once.
  await waitFor(function () {
  return lastAudited === 1;
  }, { timeoutMs: 4000 });
 
- // Steering should be injected.
  await waitFor(function () {
  return pi.calls.sendUserMessage.length === 1;
  }, { timeoutMs: 4000 });
@@ -167,12 +183,10 @@ async function main() {
  assert.match(steering.content, /Add `;`/);
  assert.equal(steering.options.deliverAs, "steer");
 
- // navigateTree should have been called once with the divergence entry id.
  assert.equal(pi.calls.navigateTree.length, 1);
  assert.equal(pi.calls.navigateTree[0].targetId, "t1");
  assert.equal(pi.calls.navigateTree[0].options.summarize, true);
 
- // Worker follows steering: append a fixed-code assistant message.
  branch.push({
  type: "message",
  id: "a2",
@@ -181,32 +195,90 @@ async function main() {
  message: { role: "assistant", content: "fn main() { println!('hello'); }" },
  });
 
- // Clean compile resets the streak.
  pi._fire("tool_result", { toolName: "bash", output: "Build succeeded." }, ctx);
  pi._fire("turn_end", {}, ctx);
 
- // DPO line should appear.
  await waitFor(function () {
  return fs.existsSync(jsonlPath);
  }, { timeoutMs: 4000 });
 
+ // -----------------------------------------------------------------------
+ // 2. Phase 3 schema assertions on the JSONL line
+ // -----------------------------------------------------------------------
  const lines = fs.readFileSync(jsonlPath, "utf8").trim().split("\n");
  assert.equal(lines.length, 1);
  const entry = JSON.parse(lines[0]);
+
  assert.equal(entry.session_id, "sess-smoke-1");
- assert.equal(entry.k3_diagnosis.inferred_subtask, "build hello world in rust");
- assert.equal(entry.k3_diagnosis.divergence_turn, 3);
+ assert.match(entry.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+ assert.equal(entry.worker_model, "minimax:MiniMax-M3");
+ assert.equal(entry.verifier_model, "test-model");
+ assert.equal(entry.trigger_reason, "compiler_streak");
+ assert.deepEqual(entry.domain_tags, ["rust"]);
  assert.equal(entry.immediate_prompt, "build me a hello world rust program");
  assert.equal(entry.rejected_completion, "fn main() { println!('hi') }");
  assert.equal(entry.chosen_completion, "fn main() { println!('hello'); }");
- assert.deepEqual(entry.domain_tags, []);
- assert.match(entry.ts, /^\d{4}-\d{2}-\d{2}T/);
+ assert.equal(entry.compiler_error_summary, "error[E0425]: cannot find value x");
+ assert.equal(entry.k3_audit.divergence_entry_id, "t1");
+ assert.equal(entry.k3_audit.flaw_category, "logic_error");
+ assert.equal(entry.k3_audit.root_cause, "missing semicolon");
+ assert.equal(entry.k3_audit.steering_instructions, "Add `;` at end of statement.");
+ assert.ok(Array.isArray(entry.active_files));
 
- console.log("Phase 2 smoke test PASSED");
+ // -----------------------------------------------------------------------
+ // 3. Phase 3 slash commands: /harvest status
+ // -----------------------------------------------------------------------
+ assert.ok(pi.commands["harvest"], "registerCommand should have been called with 'harvest'");
+ assert.equal(typeof pi.commands["harvest"].handler, "function");
+
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest", "status", ctx);
+ const statusMsg = pi.notifyCalls.find(function (m) {
+ return /\[Harvester\]/.test(m);
+ });
+ assert.ok(statusMsg, "status command should emit a [Harvester] notification");
+ assert.match(statusMsg, /turn=\d+/);
+ assert.match(statusMsg, /streak=\d+/);
+ assert.match(statusMsg, /harvests=1/);
+ assert.match(statusMsg, /state=idle/);
+ assert.match(statusMsg, /model=test-model/);
+ assert.match(statusMsg, /records=1/);
+ assert.match(statusMsg, /size=\d+B/);
+
+ // -----------------------------------------------------------------------
+ // 4. Phase 3 slash commands: /harvest audit (manual trigger)
+ // -----------------------------------------------------------------------
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest", "audit", ctx);
+ await waitFor(function () {
+ return lastAudited === 2;
+ }, { timeoutMs: 4000 });
+ const auditMsg = pi.notifyCalls.find(function (m) {
+ return /Manual audit requested/.test(m);
+ });
+ assert.ok(auditMsg, "audit command should emit a 'Manual audit requested' notification");
+
+ // Status after manual audit should show awaiting_resolution state.
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest", "status", ctx);
+ const afterMsg = pi.notifyCalls.find(function (m) {
+ return /\[Harvester\]/.test(m);
+ });
+ assert.ok(afterMsg);
+ assert.match(afterMsg, /state=awaiting_resolution/);
+
+ console.log("Phase 2 + Phase 3 smoke test PASSED");
  console.log(" DPO entry written: " + jsonlPath);
  console.log(" session_id: " + entry.session_id);
- console.log(" rejected_completion: " + entry.rejected_completion);
- console.log(" chosen_completion: " + entry.chosen_completion);
+ console.log(" worker_model: " + entry.worker_model);
+ console.log(" verifier_model: " + entry.verifier_model);
+ console.log(" trigger_reason: " + entry.trigger_reason);
+ console.log(" domain_tags: " + JSON.stringify(entry.domain_tags));
+ console.log(" active_files: " + entry.active_files.length);
+ console.log(" k3_audit.divergence_entry_id: " + entry.k3_audit.divergence_entry_id);
+ console.log(" rejected: " + entry.rejected_completion);
+ console.log(" chosen: " + entry.chosen_completion);
+ console.log(" manual audit HTTP calls: " + lastAudited);
  } finally {
  mock.server.close();
  fs.rmSync(cwd, { recursive: true, force: true });
@@ -218,6 +290,6 @@ async function main() {
 }
 
 main().catch(function (err) {
- console.error("Phase 2 smoke test FAILED:", err);
+ console.error("Phase 3 smoke test FAILED:", err);
  process.exit(1);
 });

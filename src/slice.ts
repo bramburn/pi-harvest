@@ -1,57 +1,48 @@
 /**
- * "Neat Slice" extractor.
+ * "Neat Slice" extractor + token guardrails.
  *
- * Walks the active branch backward to find the most recent user message
- * (the Inception Prompt), slices from there to the end, and pulls out
- * the last assistant code + the last compiler error from the last two
- * turns of the slice.
+ * extractNeatSlice() walks the active branch backward to find the
+ * Inception Prompt (most recent user message), slices from there to
+ * the end, and pulls out the last assistant code + the last compiler
+ * error from the last two turns of the slice.
+ *
+ * clampCompilerOutput() enforces a hard cap on bash stderr length so
+ * the verifier payload never balloons.
+ *
+ * enforcePayloadSize() guards against 64KB / 16k-token payloads.
  *
  * No LLM calls — pure structural extraction.
  */
 
+import { extractModifiedPaths } from "./workspace.js";
 import type {
  AgentMessage,
  SessionEntry,
  NeatSlice,
 } from "./types.js";
 
-/**
- * Detect a user-authored entry. pi represents all chat messages with
- * `type: "message"`; user vs assistant is on the inner `message.role`.
- */
 function isUserEntry(e: SessionEntry): e is SessionEntry & { message: AgentMessage } {
  if (e.type !== "message") return false;
  const role = (e.message as AgentMessage).role;
  return role === "user";
 }
 
-/**
- * Detect an assistant-authored entry.
- */
 function isAssistantEntry(e: SessionEntry): e is SessionEntry & { message: AgentMessage } {
  if (e.type !== "message") return false;
  const role = (e.message as AgentMessage).role;
  return role === "assistant";
 }
 
-/**
- * Detect a tool-result entry (compiler error output lives here).
- * pi uses `type: "message"` with `role: "tool"` or `role: "toolResult"`,
- * and `custom_message` entries for some flows.
- */
 function isToolResultEntry(e: SessionEntry): boolean {
- if (e.type === "message") {
+ if (e.type !== "message") {
+ return false;
+ }
  const role = (e.message as AgentMessage).role;
  return role === "tool" || role === "toolResult";
- }
- // custom_message entries can also carry tool-like payloads but we
- // treat only role-tagged tool results as compiler-error sources.
- return false;
 }
 
 /**
- * Extract a string view of an agent message's content. Handles both
- * the simple-string form and the content-parts array form.
+ * Extract a string view of an agent message's content.
  */
 export function messageToText(message: AgentMessage): string {
  const c = message.content;
@@ -60,8 +51,11 @@ export function messageToText(message: AgentMessage): string {
  return c
  .map((p) => {
  if (typeof p === "string") return p;
- if (typeof p?.text === "string") return p.text;
- if (typeof p?.content === "string") return p.content;
+ if (typeof p === "object" && p !== null) {
+ const obj = p as { text?: string; content?: string };
+ if (typeof obj.text === "string") return obj.text;
+ if (typeof obj.content === "string") return obj.content;
+ }
  return "";
  })
  .filter(Boolean)
@@ -70,9 +64,6 @@ export function messageToText(message: AgentMessage): string {
  return "";
 }
 
-/**
- * Extract a string view of an entry's payload (handles custom_message entries too).
- */
 export function entryToText(entry: SessionEntry): string {
  if (entry.type === "message") {
  return messageToText((entry as { message: AgentMessage }).message);
@@ -94,9 +85,6 @@ export function entryToText(entry: SessionEntry): string {
  return "";
 }
 
-/**
- * Find the bash tool result content from a tool-result entry.
- */
 function extractBashOutput(entry: SessionEntry): string {
  if (entry.type === "message") {
  const msg = (entry as { message: AgentMessage }).message;
@@ -109,14 +97,8 @@ function extractBashOutput(entry: SessionEntry): string {
  return entryToText(entry);
 }
 
-/**
- * Find the assistant message with the most code content in the last
- * `lookback` entries of the slice. Falls back to the most recent
- * assistant message if none has obviously "code-y" content.
- */
 function pickFailedCode(sliceEntries: SessionEntry[], lookback: number): string {
  const tail = sliceEntries.slice(-Math.max(1, lookback));
- // Walk tail backward to find an assistant message
  for (let i = tail.length - 1; i >= 0; i--) {
  const e = tail[i];
  if (isAssistantEntry(e)) {
@@ -127,20 +109,16 @@ function pickFailedCode(sliceEntries: SessionEntry[], lookback: number): string 
  return "";
 }
 
-/**
- * Find the last bash tool result in the tail of the slice that matches
- * a compiler-failure signature.
- */
-function pickCompilerError(sliceEntries: SessionEntry[], lookback: number): string {
- // Reuse the Phase-1 signature set for consistency.
- const SIGNATURES = [
+const SIGNATURES = [
  "error[e",
  "build failed",
  "error cs",
  "failed to compile",
  "tsc: error",
  "compilation failed",
- ];
+];
+
+function pickCompilerError(sliceEntries: SessionEntry[], lookback: number): string {
  const tail = sliceEntries.slice(-Math.max(1, lookback));
  for (let i = tail.length - 1; i >= 0; i--) {
  const e = tail[i];
@@ -156,11 +134,72 @@ function pickCompilerError(sliceEntries: SessionEntry[], lookback: number): stri
 }
 
 /**
+ * Clamp compiler stderr to a verifier-friendly size.
+ *
+ * Strategy:
+ * 1. Strip warning lines (noisy, low-signal).
+ * 2. Keep lines that match error/panic/exception patterns, plus
+ * surrounding context lines.
+ * 3. Hard cap to `maxLines` total.
+ * 4. Append a marker so the verifier knows it was truncated.
+ */
+export function clampCompilerOutput(rawStderr: string, maxLines: number = 50): string {
+ if (!rawStderr) return "";
+ const allLines = rawStderr.split(/\r?\n/);
+ // Drop pure warning lines to keep signal high.
+ const filtered = allLines.filter((l) => {
+ const lower = l.toLowerCase();
+ if (lower.includes("warning:") || lower.includes("warning[")) return false;
+ // Drop very short noise lines (single char, etc.)
+ if (l.trim().length === 0) return false;
+ return true;
+ });
+ // Prefer error-ish lines plus 1 line of context above each.
+ const errorishRe = /(error\b|error\[|failed to compile|exception|panic|traceback|fatal|\^)/i;
+ const kept: string[] = [];
+ let i = 0;
+ while (i < filtered.length && kept.length < maxLines) {
+ const line = filtered[i];
+ if (errorishRe.test(line)) {
+ if (kept.length > 0 && kept[kept.length - 1] !== filtered[i - 1]) {
+ kept.push(filtered[i - 1]);
+ }
+ kept.push(line);
+ if (i + 1 < filtered.length) {
+ kept.push(filtered[i + 1]);
+ }
+ }
+ i++;
+ }
+ let result = kept.join("\n");
+ if (rawStderr.trim().length > 0 && (result.length < filtered.length || kept.length >= maxLines || result.length === 0)) {
+ if (result.length > 0 && !result.endsWith("\n")) result += "\n";
+ result += "[... compiler output clamped for harvest ...]";
+ }
+ return result;
+}
+
+/**
+ * Enforce a hard byte cap on the verifier payload. Returns the
+ * original string if within budget, or a clamped copy with a marker.
+ */
+export function enforcePayloadSize(payload: string, maxBytes: number = 64 * 1024): string {
+ if (Buffer.byteLength(payload, "utf8") <= maxBytes) return payload;
+ // Clamp by bytes (chop at the last newline before the limit).
+ const buf = Buffer.from(payload, "utf8");
+ const sliced = buf.subarray(0, maxBytes).toString("utf8");
+ const lastNewline = sliced.lastIndexOf("\n");
+ const cut = lastNewline > 0 ? sliced.slice(0, lastNewline) : sliced;
+ return cut + "\n\n[... payload clamped to " + maxBytes + " bytes for harvest ...]";
+}
+
+/**
  * Extract the neat slice from the active branch.
  *
  * @param branchEntries - sessionManager.getBranch() output (oldest -> newest).
+ * @param cwd - current working directory; used to collect modified paths.
  */
-export function extractNeatSlice(branchEntries: SessionEntry[]): NeatSlice {
+export function extractNeatSlice(branchEntries: SessionEntry[], cwd: string = ""): NeatSlice {
  if (!Array.isArray(branchEntries) || branchEntries.length === 0) {
  return {
  inceptionIndex: -1,
@@ -168,12 +207,13 @@ export function extractNeatSlice(branchEntries: SessionEntry[]): NeatSlice {
  sliceEntries: [],
  failedCode: "",
  compilerError: "",
+ compilerErrorRaw: "",
  inceptionPrompt: "",
+ modifiedPaths: [],
  divergenceEntryId: null,
  };
  }
 
- // Walk BACKWARD to find the most recent user entry.
  let inceptionIndex = -1;
  for (let i = branchEntries.length - 1; i >= 0; i--) {
  if (isUserEntry(branchEntries[i])) {
@@ -182,30 +222,26 @@ export function extractNeatSlice(branchEntries: SessionEntry[]): NeatSlice {
  }
  }
 
- if (inceptionIndex < 0) {
- // No user message in the branch at all — degenerate session.
- return {
- inceptionIndex: -1,
- branchEntries,
- sliceEntries: [...branchEntries],
- failedCode: pickFailedCode(branchEntries, 2),
- compilerError: pickCompilerError(branchEntries, 2),
- inceptionPrompt: "",
- divergenceEntryId: null,
- };
- }
+ const sliceEntries =
+ inceptionIndex < 0 ? [...branchEntries] : branchEntries.slice(inceptionIndex);
+ const inceptionPrompt = inceptionIndex >= 0 ? entryToText(branchEntries[inceptionIndex]) : "";
 
- const sliceEntries = branchEntries.slice(inceptionIndex);
- const inceptionPrompt = entryToText(branchEntries[inceptionIndex]);
+ const failedCode = pickFailedCode(sliceEntries, 2);
+ const compilerErrorRaw = pickCompilerError(sliceEntries, 2);
+ const compilerError = clampCompilerOutput(compilerErrorRaw, 50);
+
+ const modifiedPaths = cwd ? extractModifiedPaths(sliceEntries, cwd) : [];
 
  return {
  inceptionIndex,
  branchEntries,
  sliceEntries,
- failedCode: pickFailedCode(sliceEntries, 2),
- compilerError: pickCompilerError(sliceEntries, 2),
+ failedCode,
+ compilerError,
+ compilerErrorRaw,
  inceptionPrompt,
- divergenceEntryId: null, // populated by splice.ts once we have the audit
+ modifiedPaths,
+ divergenceEntryId: null,
  };
 }
 
@@ -213,8 +249,6 @@ export function extractNeatSlice(branchEntries: SessionEntry[]): NeatSlice {
  * Serialize a slice into a numbered transcript for the Verifier LLM.
  * Each entry is prefixed with `=== TURN <n> (type) ===` so the verifier
  * can identify which entry to flag as the divergence point.
- *
- * @returns a multi-line string the verifier can read.
  */
 export function serializeSliceForVerifier(slice: NeatSlice): string {
  const lines: string[] = [];
@@ -225,7 +259,9 @@ export function serializeSliceForVerifier(slice: NeatSlice): string {
  ? ((entry as { message: AgentMessage }).message.role ?? entry.type)
  : entry.type;
  const text = entryToText(entry);
- lines.push(`=== TURN ${i + 1} (${role}) ===`);
+ // Each entry's text is already content; we don't apply clampCompilerOutput
+ // here — the slice.compilerError is the curated version we send if needed.
+ lines.push("=== TURN " + (i + 1) + " (" + role + ") ===");
  lines.push(text || "(empty)");
  lines.push("");
  }
@@ -233,25 +269,40 @@ export function serializeSliceForVerifier(slice: NeatSlice): string {
 }
 
 /**
+ * Build the full user payload (transcript + summary) and apply the
+ * 64KB clamp. Returns the final string ready to send to the verifier.
+ */
+export function buildVerifierPayload(slice: NeatSlice): string {
+ const parts: string[] = [];
+ if (slice.inceptionPrompt) {
+ parts.push("=== INCEPTION PROMPT ===\n" + slice.inceptionPrompt);
+ }
+ if (slice.compilerError) {
+ parts.push("=== COMPILER ERROR (clamped) ===\n" + slice.compilerError);
+ }
+ if (slice.failedCode) {
+ parts.push("=== LAST ASSISTANT CODE ===\n" + slice.failedCode);
+ }
+ if (slice.modifiedPaths.length > 0) {
+ parts.push("=== ACTIVE FILES ===\n" + slice.modifiedPaths.join("\n"));
+ }
+ parts.push("=== TRANSCRIPT ===\n" + serializeSliceForVerifier(slice));
+ const joined = parts.join("\n\n");
+ return enforcePayloadSize(joined, 64 * 1024);
+}
+
+/**
  * Map a slice-relative 1-based turn number from the verifier audit to an
  * entry id in the active branch. Returns null if out of range.
  *
- * The verifier's `divergence_turn` is 1-based and relative to the slice
- * (turn 1 = sliceEntries[0], which is the inception prompt).
- *
- * For navigateTree, we want the entry JUST BEFORE the divergence, so
- * divergence_turn=1 means "no preceding entry" and we navigate to
- * sliceEntries[0].id (the inception prompt itself).
+ * Phase 3 prefers `divergence_turn_entry_id` returned directly by the
+ * verifier; this helper is kept for the Phase 2 fallback path.
  */
 export function entryIdForDivergenceTurn(
  slice: NeatSlice,
  divergenceTurn: number,
 ): string | null {
  if (!Number.isFinite(divergenceTurn) || divergenceTurn < 1) return null;
- // We want to navigate to the entry just before divergence, i.e.
- // sliceEntries[divergenceTurn - 1] (the bad entry itself) so it
- // becomes a sibling of the new branch. The verifier-relative
- // turn count starts at 1 for the inception prompt.
  const idx = Math.min(divergenceTurn - 1, slice.sliceEntries.length - 1);
  const entry = slice.sliceEntries[idx];
  return entry?.id ?? null;
