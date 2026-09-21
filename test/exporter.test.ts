@@ -179,3 +179,106 @@ test("exportToHuggingFaceDPO: writes to exports/ subdirectory", async () => {
  await rm(cwd, { recursive: true, force: true });
  }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7: SFT exporter
+// ---------------------------------------------------------------------------
+
+test("mapRecordToHfSFT: maps a Golden SFT record to HF messages format", () => {
+ const out = exporter.mapRecordToHfSFT({
+ session_id: "s",
+ timestamp: "2026-09-21T12:00:00.000Z",
+ worker_model: "minimax",
+ domain_tags: ["rust"],
+ immediate_prompt: "build hello",
+ active_files: [{ path: "src/main.rs", content: "fn main() {}" }],
+ git_diff_summary: "diff --git a/main.rs",
+ chosen_completion: "fn main() { println!(\"hi\"); }",
+ });
+ assert.equal(out.messages.length, 2);
+ assert.equal(out.messages[0].role, "user");
+ assert.equal(out.messages[1].role, "assistant");
+ assert.equal(out.messages[1].content, 'fn main() { println!("hi"); }');
+ assert.match(out.messages[0].content, /build hello/);
+ assert.match(out.messages[0].content, /GIT DIFF/);
+ assert.match(out.messages[0].content, /src\/main\.rs/);
+ assert.match(out.messages[0].content, /fn main/);
+});
+
+test("mapRecordToHfSFT: tolerates missing fields without throwing", () => {
+ const out = exporter.mapRecordToHfSFT({});
+ assert.equal(out.messages.length, 2);
+ assert.equal(out.messages[1].content, "");
+ assert.match(out.messages[0].content, /\(no immediate prompt captured\)/);
+});
+
+test("mapRecordToHfSFT: skips active_files cleanly when array missing", () => {
+ const out = exporter.mapRecordToHfSFT({ immediate_prompt: "x" });
+ assert.match(out.messages[0].content, /^x/);
+ assert.doesNotMatch(out.messages[0].content, /ACTIVE FILES/);
+});
+
+test("sftExportFilename: format YYYY_MM_DD", () => {
+ const fixed = new Date(Date.UTC(2026, 8, 21));
+ assert.equal(exporter.sftExportFilename(fixed), "sft_dataset_2026_09_21.jsonl");
+});
+
+test("exportToHuggingFaceSFT: streams every record into a single export file", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const dir = join(cwd, ".pi", "harvest");
+ await mkdir(dir, { recursive: true });
+ const records = [
+ {
+ session_id: "s1",
+ timestamp: "2026-09-21T10:00:00.000Z",
+ worker_model: "minimax",
+ domain_tags: ["rust"],
+ immediate_prompt: "build 1",
+ active_files: [],
+ git_diff_summary: null,
+ chosen_completion: "C1",
+ },
+ {
+ session_id: "s2",
+ timestamp: "2026-09-21T11:00:00.000Z",
+ worker_model: "minimax",
+ domain_tags: ["typescript"],
+ immediate_prompt: "build 2",
+ active_files: [{ path: "x.ts", content: "export const x = 1;" }],
+ git_diff_summary: "diff --git a/x.ts",
+ chosen_completion: "C2",
+ },
+ ];
+ const sftPath = sink.currentSftSinkPath(cwd);
+ for (const r of records) {
+ await writeFile(sftPath, JSON.stringify(r) + "\n", { encoding: "utf8", flag: "a" });
+ }
+ const result = await exporter.exportToHuggingFaceSFT({ cwd });
+ assert.equal(result.count, 2);
+ assert.ok(result.bytes > 0);
+ assert.match(result.path, /sft_dataset_\d{4}_\d{2}_\d{2}\.jsonl$/);
+
+ const outPath = join(cwd, ".pi", "harvest", "exports", exporter.sftExportFilename(new Date()));
+ const lines = (await readFile(outPath, "utf8")).trim().split("\n");
+ assert.equal(lines.length, 2);
+ for (const line of lines) {
+ const parsed = JSON.parse(line);
+ assert.equal(parsed.messages.length, 2);
+ assert.equal(parsed.messages[0].role, "user");
+ assert.equal(parsed.messages[1].role, "assistant");
+ }
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("exportToHuggingFaceSFT: handles empty SFT sink gracefully", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const result = await exporter.exportToHuggingFaceSFT({ cwd });
+ assert.equal(result.count, 0);
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});

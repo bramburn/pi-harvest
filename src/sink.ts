@@ -24,6 +24,7 @@ import { createInterface } from "node:readline";
 
 import type {
  ActiveFile,
+ GoldenSFTRecord,
  HarvestedTrajectoryRecord,
  NeatSlice,
  VerifierAudit,
@@ -54,6 +55,66 @@ export function currentSinkFilename(now: Date = new Date()): string {
  const y = now.getUTCFullYear();
  const m = String(now.getUTCMonth() + 1).padStart(2, "0");
  return `trajectories_${y}_${m}.jsonl`;
+}
+
+/**
+ * Compute the active month's SFT Golden sink filename.
+ * Format: `sft_golden_YYYY_MM.jsonl`.
+ */
+export function currentSftSinkFilename(now: Date = new Date()): string {
+ const y = now.getUTCFullYear();
+ const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+ return `sft_golden_${y}_${m}.jsonl`;
+}
+
+/**
+ * Resolve the absolute path to the active SFT Golden sink file.
+ */
+export function currentSftSinkPath(cwd: string, now: Date = new Date()): string {
+ return join(cwd, ".pi", "harvest", currentSftSinkFilename(now));
+}
+
+/**
+ * Discover all SFT Golden sink files.
+ */
+export function listSftFiles(cwd: string): string[] {
+ const dir = join(cwd, ".pi", "harvest");
+ if (!existsSync(dir)) return [];
+ const { readdirSync } = require("node:fs") as typeof import("node:fs");
+ const entries = readdirSync(dir);
+ return entries
+ .filter((name: string) => /^sft_golden.*\.jsonl$/.test(name))
+ .map((name: string) => join(dir, name))
+ .sort();
+}
+
+/**
+ * Append one GoldenSFTRecord as a JSONL line to the active month's
+ * SFT Golden sink. Creates the directory if missing.
+ */
+export function appendGoldenSFT(cwd: string, record: GoldenSFTRecord, now: Date = new Date()): SinkResult {
+ const dir = join(cwd, ".pi", "harvest");
+ mkdirSync(dir, { recursive: true });
+ const filePath = currentSftSinkPath(cwd, now);
+ const line = JSON.stringify(record) + "\n";
+ appendFileSync(filePath, line, { encoding: "utf8" });
+ return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };
+}
+
+/**
+ * Sync count of SFT Golden records in the current month's sink.
+ */
+export function countSftRecords(cwd: string, now: Date = new Date()): number {
+ const filePath = currentSftSinkPath(cwd, now);
+ if (!existsSync(filePath)) return 0;
+ const buf = (require("node:fs") as typeof import("node:fs")).readFileSync(filePath, "utf8") as string;
+ if (!buf) return 0;
+ let n = 0;
+ for (let i = 0; i < buf.length; i++) {
+ if (buf.charCodeAt(i) === 10) n++;
+ }
+ if (!buf.endsWith("\n")) n++;
+ return n;
 }
 
 /**

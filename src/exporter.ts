@@ -20,11 +20,11 @@
  * Output: `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`.
  */
 
-import { appendFileSync, createReadStream, mkdirSync, existsSync } from "node:fs";
+import { appendFileSync, createReadStream, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { createInterface } from "node:readline";
 
-import { listSinkFiles } from "./sink.js";
+import { listSinkFiles, listSftFiles } from "./sink.js";
 
 export interface ExportOptions {
  cwd: string;
@@ -116,7 +116,6 @@ export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<Expor
 
  const outPath = join(dir, exportFilename(now));
  // Truncate any existing export for today so re-runs are deterministic.
- const { writeFileSync } = await import("node:fs");
  writeFileSync(outPath, "", { encoding: "utf8" });
 
  const sources = listSinkFiles(opts.cwd);
@@ -140,6 +139,106 @@ export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<Expor
  return;
  }
  const mapped = mapRecordToHfDpo(parsed);
+ const out = JSON.stringify(mapped) + "\n";
+ appendFileSync(outPath, out, { encoding: "utf8" });
+ count++;
+ bytes += Buffer.byteLength(out, "utf8");
+ });
+ rl.on("close", () => resolve());
+ rl.on("error", reject);
+ });
+ }
+
+ return { path: outPath, count, bytes, sources };
+}
+
+// ============================================================================
+// SFT Golden exporter (Phase 7)
+// ============================================================================
+
+/**
+ * Map a Phase 7 Golden SFT record to the standard Hugging Face
+ * conversational SFT format expected by `trl.SFTTrainer`:
+ *
+ * { "messages": [{ "role": "user", "content": "..." }, { "role": "assistant", "content": "..." }] }
+ */
+export function mapRecordToHfSFT(record: any): {
+ messages: Array<{ role: string; content: string }>;
+} {
+ const promptParts: string[] = [];
+ const immediate = typeof record?.immediate_prompt === "string" ? record.immediate_prompt : "";
+ if (immediate) {
+ promptParts.push(immediate);
+ } else {
+ promptParts.push("(no immediate prompt captured)");
+ }
+ const diff = typeof record?.git_diff_summary === "string" ? record.git_diff_summary : "";
+ if (diff && diff.trim().length > 0) {
+ promptParts.push("\n=== GIT DIFF (uncommitted, clamped) ===\n" + diff);
+ }
+ const files = Array.isArray(record?.active_files) ? record.active_files : [];
+ if (files.length > 0) {
+ promptParts.push("\n=== ACTIVE FILES ===");
+ for (const f of files) {
+ if (!f || typeof f !== "object") continue;
+ const path = typeof f.path === "string" ? f.path : "?";
+ const content = typeof f.content === "string" ? f.content : "";
+ promptParts.push("--- " + path + " ---");
+ promptParts.push(content || "(empty)");
+ }
+ }
+
+ return {
+ messages: [
+ { role: "user", content: promptParts.join("\n") },
+ { role: "assistant", content: typeof record?.chosen_completion === "string" ? record.chosen_completion : "" },
+ ],
+ };
+}
+
+/**
+ * Compute the SFT export filename. Format: `sft_dataset_YYYY_MM_DD.jsonl`.
+ */
+export function sftExportFilename(now: Date = new Date()): string {
+ const y = now.getUTCFullYear();
+ const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+ const d = String(now.getUTCDate()).padStart(2, "0");
+ return `sft_dataset_${y}_${m}_${d}.jsonl`;
+}
+
+/**
+ * Stream-read every SFT Golden sink file and append mapped HF-SFT
+ * records to the export file. Returns the output path + record count.
+ */
+export async function exportToHuggingFaceSFT(opts: ExportOptions): Promise<ExportResult> {
+ const now = opts.now ?? new Date();
+ const dir = join(opts.cwd, ".pi", "harvest", "exports");
+ mkdirSync(dir, { recursive: true });
+
+ const outPath = join(dir, sftExportFilename(now));
+ writeFileSync(outPath, "", { encoding: "utf8" });
+
+ const sources = listSftFiles(opts.cwd);
+ let count = 0;
+ let bytes = 0;
+
+ for (const sourcePath of sources) {
+ if (!existsSync(sourcePath)) continue;
+ const rl = createInterface({
+ input: createReadStream(sourcePath, { encoding: "utf8" }),
+ crlfDelay: Infinity,
+ });
+ await new Promise<void>((resolve, reject) => {
+ rl.on("line", (line) => {
+ const trimmed = line.trim();
+ if (!trimmed) return;
+ let parsed: any;
+ try {
+ parsed = JSON.parse(trimmed);
+ } catch {
+ return;
+ }
+ const mapped = mapRecordToHfSFT(parsed);
  const out = JSON.stringify(mapped) + "\n";
  appendFileSync(outPath, out, { encoding: "utf8" });
  count++;

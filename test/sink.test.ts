@@ -384,3 +384,120 @@ test("buildTrajectoryRecord: tolerates null git_diff_summary", () => {
  });
  assert.equal(rec.git_diff_summary, null);
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7: SFT Golden sink
+// ---------------------------------------------------------------------------
+
+import type { GoldenSFTRecord } from "../dist/types.js";
+
+const BASE_SFT: GoldenSFTRecord = {
+ session_id: "sess-sft-1",
+ timestamp: "2026-09-21T12:00:00.000Z",
+ worker_model: "minimax:MiniMax-M3",
+ domain_tags: ["rust", "tauri"],
+ immediate_prompt: "build a hello world",
+ active_files: [{ path: "src/main.rs", content: "fn main() {}" }],
+ git_diff_summary: null,
+ chosen_completion: "fn main() { println!(\"hi\"); }",
+};
+
+test("currentSftSinkFilename: format is sft_golden_YYYY_MM.jsonl", () => {
+ const fixed = new Date(Date.UTC(2026, 8, 21));
+ assert.equal(sink.currentSftSinkFilename(fixed), "sft_golden_2026_09.jsonl");
+ const fixed2 = new Date(Date.UTC(2026, 11, 1));
+ assert.equal(sink.currentSftSinkFilename(fixed2), "sft_golden_2026_12.jsonl");
+ const fixed3 = new Date(Date.UTC(2027, 0, 5));
+ assert.equal(sink.currentSftSinkFilename(fixed3), "sft_golden_2027_01.jsonl");
+});
+
+test("currentSftSinkPath: full path under .pi/harvest/", () => {
+ const p = sink.currentSftSinkPath("/tmp/proj", new Date(Date.UTC(2026, 8, 21)));
+ assert.match(p, /[\\/]\.pi[\\/]harvest[\\/]sft_golden_2026_09\.jsonl$/);
+});
+
+test("appendGoldenSFT: creates .pi/harvest and writes one JSON line", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const result = sink.appendGoldenSFT(cwd, BASE_SFT);
+ assert.equal(result.bytes > 0, true);
+ assert.match(result.path, /sft_golden_\d{4}_\d{2}\.jsonl$/);
+ const lines = (await readFile(result.path, "utf8")).trim().split("\n");
+ assert.equal(lines.length, 1);
+ const parsed = JSON.parse(lines[0]) as GoldenSFTRecord;
+ assert.equal(parsed.session_id, "sess-sft-1");
+ assert.equal(parsed.chosen_completion, BASE_SFT.chosen_completion);
+ assert.equal(parsed.domain_tags.length, 2);
+ assert.equal(parsed.active_files.length, 1);
+ assert.equal(parsed.git_diff_summary, null);
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("appendGoldenSFT: appends across calls in the same month", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const t = new Date(Date.UTC(2026, 8, 21));
+ sink.appendGoldenSFT(cwd, BASE_SFT, t);
+ sink.appendGoldenSFT(cwd, { ...BASE_SFT, session_id: "s2", chosen_completion: "fn main() { println!(\"hi2\"); }" }, t);
+ const lines = (await readFile(sink.currentSftSinkPath(cwd, t), "utf8")).trim().split("\n");
+ assert.equal(lines.length, 2);
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("appendGoldenSFT: rolls to a new file when month changes", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const sep = sink.appendGoldenSFT(cwd, BASE_SFT, new Date(Date.UTC(2026, 8, 21)));
+ const oct = sink.appendGoldenSFT(cwd, { ...BASE_SFT, session_id: "oct" }, new Date(Date.UTC(2026, 9, 1)));
+ assert.match(sep.path, /sft_golden_2026_09\.jsonl$/);
+ assert.match(oct.path, /sft_golden_2026_10\.jsonl$/);
+ assert.notEqual(sep.path, oct.path);
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("countSftRecords: counts lines in the current month's sink", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const t = new Date(Date.UTC(2026, 8, 21));
+ sink.appendGoldenSFT(cwd, BASE_SFT, t);
+ sink.appendGoldenSFT(cwd, BASE_SFT, t);
+ sink.appendGoldenSFT(cwd, BASE_SFT, t);
+ assert.equal(sink.countSftRecords(cwd, t), 3);
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("countSftRecords: returns 0 when sink file is missing", () => {
+ const cwd = join(tmpdir(), "pi-harvest-missing-sft-" + Date.now());
+ assert.equal(sink.countSftRecords(cwd), 0);
+});
+
+test("listSftFiles: discovers sft_golden files and ignores other files", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const harvestDir = join(cwd, ".pi", "harvest");
+ await mkdir(harvestDir, { recursive: true });
+ await writeFile(join(harvestDir, "sft_golden_2026_08.jsonl"), "{}\n", "utf8");
+ await writeFile(join(harvestDir, "sft_golden_2026_09.jsonl"), "{}\n", "utf8");
+ await writeFile(join(harvestDir, "trajectories_2026_09.jsonl"), "{}\n", "utf8");
+ await writeFile(join(harvestDir, "readme.txt"), "ignore", "utf8");
+ const files = sink.listSftFiles(cwd);
+ assert.equal(files.length, 2);
+ assert.ok(files[0].endsWith("sft_golden_2026_08.jsonl"));
+ assert.ok(files[1].endsWith("sft_golden_2026_09.jsonl"));
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("listSftFiles: returns empty array when .pi/harvest is missing", () => {
+ const cwd = join(tmpdir(), "pi-harvest-no-harvest-" + Date.now());
+ assert.deepEqual(sink.listSftFiles(cwd), []);
+});

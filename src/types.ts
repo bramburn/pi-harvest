@@ -137,6 +137,27 @@ export interface HarvestedTrajectoryRecord {
 }
 
 /**
+ * SFT Golden Record (Phase 7): passively captured when the worker
+ * completes a task in 1 or 2 turns with no compile failures or audit
+ * in flight. No Verifier call; local extraction only.
+ *
+ * Distinct from HarvestedTrajectoryRecord in that there is no
+ * `rejected_completion` (nothing was rejected), no `k3_audit`, and no
+ * `compiler_error_summary` (nothing failed). It is the *positive*
+ * training signal.
+ */
+export interface GoldenSFTRecord {
+ session_id: string;
+ timestamp: string;
+ worker_model: string;
+ domain_tags: string[];
+ immediate_prompt: string;
+ active_files: Array<{ path: string; content: string }>;
+ git_diff_summary: string | null;
+ chosen_completion: string;
+}
+
+/**
  * Thrown by invokeVerifier() when all retry attempts are exhausted.
  * Callers should catch this and reset their streak rather than
  * crashing or re-throwing.

@@ -23,15 +23,16 @@
  * is never permanently blocked by a flaky verifier endpoint.
  */
 
-import { writeDpoEntry, getSinkStats, currentSinkPath } from "./sink.js";
+import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
-import { exportToHuggingFaceDPO } from "./exporter.js";
+import { exportToHuggingFaceDPO, exportToHuggingFaceSFT } from "./exporter.js";
 import { aggregateTelemetry, formatTelemetryForNotify } from "./telemetry.js";
 import type {
  ActiveFile,
+ GoldenSFTRecord,
  NeatSlice,
  SessionEntry,
  VerifierAudit,
@@ -121,6 +122,7 @@ const SIGNATURE_REGEX = new RegExp(
 const TURN_INTERVAL = Number(process.env.HARVEST_TURN_INTERVAL ?? "30");
 const STREAK_THRESHOLD = Number(process.env.HARVEST_STREAK_THRESHOLD ?? "3");
 const THRASHING_THRESHOLD = Number(process.env.HARVEST_THRASHING_THRESHOLD ?? "6");
+const SFT_TURN_LIMIT = Number(process.env.HARVEST_SFT_TURN_LIMIT ?? "2");
 const STATUS_KEY = "harvester";
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
@@ -151,6 +153,10 @@ export default function (pi: ExtensionAPI): void {
  let lastAudit: VerifierAudit | null = null;
  let lastReviewFeedback: string | null = null;
  let lastError: LastError | null = null;
+ // Phase 7: SFT Golden Data capture
+ let assistantTurnsSinceUserInput = 0; // for zero-shot detection
+ let lastGoldenSftTurn = -1; // debounce so we don't recapture the same success
+ let sftCount = 0; // total Golden SFT records written this session
  let lastSlice: NeatSlice | null = null;
  let lastActiveFiles: ActiveFile[] = [];
  let lastRejected: string = "";
@@ -183,6 +189,8 @@ export default function (pi: ExtensionAPI): void {
  compilerFailStreak +
  " | Harvests: " +
  harvestCount +
+ " | SFT: " +
+ sftCount +
  " | State: " +
  state +
  (lastAuditedTurn > 0 ? " | LastAudit: " + lastAuditedTurn : "")
@@ -456,16 +464,28 @@ export default function (pi: ExtensionAPI): void {
  }
 
  if (trimmed === "export" || trimmed.startsWith("export ")) {
+ const exportTarget = trimmed === "export" ? "dpo" : trimmed.replace(/^export\s+/, "").trim();
  try {
+ if (exportTarget === "sft") {
+ const result = await exportToHuggingFaceSFT({ cwd: c.cwd });
+ notify(
+ c,
+ "SFT export written: " + result.path + " (" + result.count + " records, " + result.bytes + " bytes)",
+ "info",
+ );
+ } else if (exportTarget === "dpo" || exportTarget === "") {
  const result = await exportToHuggingFaceDPO({ cwd: c.cwd });
  notify(
  c,
  "DPO export written: " + result.path + " (" + result.count + " records, " + result.bytes + " bytes)",
  "info",
  );
+ } else {
+ notify(c, "Usage: /harvest export dpo | /harvest export sft", "warn");
+ }
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
- notify(c, "DPO export failed: " + msg, "warn");
+ notify(c, "Export failed: " + msg, "warn");
  }
  return;
  }
@@ -480,6 +500,8 @@ export default function (pi: ExtensionAPI): void {
  compilerFailStreak +
  " harvests=" +
  harvestCount +
+ " sft=" +
+ sftCount +
  " state=" +
  state +
  (lastAuditedTurn > 0 ? " lastAudit=" + lastAuditedTurn : "");
@@ -496,12 +518,15 @@ export default function (pi: ExtensionAPI): void {
  " size=" +
  stats.sizeBytes +
  "B";
- const line4 = "Worker: " + workerModelId(c);
- const line5 = formatTelemetryForNotify(telemetry);
- const line6 = lastError
+ const sftPath = currentSftSinkPath(c.cwd);
+ const sftCountOnDisk = countSftRecords(c.cwd);
+ const line4 = "SFT: " + sftPath + " records=" + sftCountOnDisk;
+ const line5 = "Worker: " + workerModelId(c);
+ const line6 = formatTelemetryForNotify(telemetry);
+ const line7 = lastError
  ? "LastError: " + lastError.source + " @ " + lastError.ts + " - " + lastError.message + " (run /harvest audit to retry)"
  : "LastError: (none)";
- c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n" + line5 + "\n " + line6, "info");
+ c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n " + line5 + "\n" + line6 + "\n " + line7, "info");
  paint(c);
  },
  });
@@ -555,6 +580,78 @@ export default function (pi: ExtensionAPI): void {
  haystack = haystack.toLowerCase();
  if (!haystack) return false;
  return !SIGNATURE_REGEX.test(haystack);
+ }
+
+ /**
+ * Phase 7: capture a Golden SFT record when the worker has succeeded
+ * zero-shot (1-2 turns, no compile failures, no audit in flight).
+ *
+ * Synchronous local extraction - NO verifier call. The slice is just
+ * re-extracted from the branch so we get the up-to-date assistant text.
+ */
+ function harvestGoldenSFT(ctx: PiContext): void {
+ if (state !== "idle") return; // don't capture during audit resolution
+ if (turnCounter - lastGoldenSftTurn < 2) return; // debounce
+ const c = ctx;
+ try {
+ const branch = ctx.sessionManager.getBranch();
+ const slice = extractNeatSlice(branch, ctx.cwd);
+ const chosen = extractLatestAssistant(branch);
+ if (!chosen || chosen.trim().length < 8) return; // nothing meaningful
+
+ const modifiedPaths = slice.modifiedPaths;
+ captureActiveFileStates(ctx.cwd, modifiedPaths).then(
+ (activeFiles) => {
+ const record: GoldenSFTRecord = {
+ session_id: ctx.sessionManager?.getSessionId?.() ?? "unknown",
+ timestamp: new Date().toISOString(),
+ worker_model: workerModelId(ctx),
+ domain_tags: inferDomainTags(modifiedPaths),
+ immediate_prompt: slice.inceptionPrompt,
+ active_files: activeFiles.map((f) => ({
+ path: f.path,
+ content: typeof f.content === "string" ? f.content : "",
+ })),
+ git_diff_summary: extractGitDiff(ctx.cwd),
+ chosen_completion: chosen,
+ };
+ try {
+ const res = appendGoldenSFT(ctx.cwd, record);
+ sftCount += 1;
+ lastGoldenSftTurn = turnCounter;
+ notify(c, "Golden SFT Captured! -> " + res.path + " (" + record.chosen_completion.length + " chars chosen)", "info");
+ } catch (err) {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "Golden SFT write failed: " + msg, "warn");
+ }
+ paint(c);
+ },
+ () => {
+ // captureActiveFileStates rejected - skip silently, file capture isn't required.
+ const record: GoldenSFTRecord = {
+ session_id: ctx.sessionManager?.getSessionId?.() ?? "unknown",
+ timestamp: new Date().toISOString(),
+ worker_model: workerModelId(ctx),
+ domain_tags: inferDomainTags(modifiedPaths),
+ immediate_prompt: slice.inceptionPrompt,
+ active_files: [],
+ git_diff_summary: extractGitDiff(ctx.cwd),
+ chosen_completion: chosen,
+ };
+ try {
+ const res = appendGoldenSFT(ctx.cwd, record);
+ sftCount += 1;
+ lastGoldenSftTurn = turnCounter;
+ notify(c, "Golden SFT Captured! -> " + res.path, "info");
+ } catch (err) {
+ // ignore
+ }
+ paint(c);
+ },
+ );
+ } catch (err) {
+ // Swallow - SFT capture is best-effort and must NEVER interfere with normal ops.
+ }
  }
 
  /**
@@ -838,12 +935,63 @@ export default function (pi: ExtensionAPI): void {
  if (raw.length > 0) compilerFailStreak = 0;
  }
 
+ // Phase 7: zero-shot success mining. Fire ONLY when:
+ // - this bash result was clean (no compiler signature in the output)
+ // - compilerFailStreak is currently 0 (no recent failures)
+ // - state is idle (no audit resolution in flight - failing criterion)
+ // - assistantTurnsSinceUserInput <= SFT_TURN_LIMIT (the worker got it in 1-2 turns)
+ // - lastGoldenSftTurn is at least 2 turns behind (debounce so we don't
+ // fire on every subsequent tool_result in the same successful turn)
+ const trForDetection: LooseToolResult = {
+ toolName: e.toolName,
+ isError: false,
+ content: [typeof raw === "string" ? { text: raw } : { text: "" }],
+ };
+ if (
+ SFT_TURN_LIMIT > 0 &&
+ isCleanBashResult(trForDetection) &&
+ compilerFailStreak === 0 &&
+ state === "idle" &&
+ assistantTurnsSinceUserInput <= SFT_TURN_LIMIT
+ ) {
+ harvestGoldenSFT(c);
+ }
+
  paint(c);
  });
 
  pi.on("turn_end", (event, ctx) => {
  const c = ctx as PiContext;
  turnCounter += 1;
+
+ // Phase 7: track how many consecutive assistant turns have happened
+ // since the last user message. We detect a user-message-driven turn
+ // by checking the branch entry immediately before the final assistant
+ // message: if it's a user message, this is a brand-new task and we
+ // reset the counter; otherwise the worker is iterating on the same
+ // task and we increment.
+ try {
+ const branch = ctx.sessionManager.getBranch();
+ for (let i = branch.length - 1; i >= 0; i--) {
+ const e = branch[i];
+ if (e.type === "message" && (e.message as { role?: string }).role === "assistant") {
+ if (i > 0) {
+ const prev = branch[i - 1];
+ if (
+ prev.type === "message" &&
+ (prev.message as { role?: string }).role === "user"
+ ) {
+ assistantTurnsSinceUserInput = 0;
+ } else {
+ assistantTurnsSinceUserInput += 1;
+ }
+ }
+ break;
+ }
+ }
+ } catch {
+ // Defensive: don't block turn_end on introspection errors.
+ }
 
  // 1) If a previous audit is awaiting resolution AND the worker just
  // produced clean bash output, write the DPO record.
