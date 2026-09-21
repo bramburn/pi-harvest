@@ -398,6 +398,43 @@ export default function (pi: ExtensionAPI): void {
  return;
  }
 
+ if (trimmed === "retry") {
+ if (auditInFlight) {
+ notify(c, "Audit already in flight", "warn");
+ return;
+ }
+ if (!lastError) {
+ notify(c, "Nothing to retry (no prior failure recorded). Use /harvest audit or /harvest review <feedback>.", "info");
+ return;
+ }
+ notify(
+ c,
+ "Retrying last failed operation (" + lastError.source + ") at " + lastError.ts + " - last cause: " + lastError.message,
+ "info",
+ );
+ // Audit retry can fully re-extract slice/active files from the branch;
+ // review retry would need the original feedback string which we don't
+ // cache, so the audit path covers the common case.
+ if (lastError.source === "audit") {
+ runAudit(c, "manual");
+ } else if (lastError.source === "distillation") {
+ // Distillation is non-blocking and auto-runs in turn_end when the
+ // streak reaches threshold; nothing to "retry" here.
+ notify(
+ c,
+ "Distillation is non-blocking and auto-runs when thrashing is detected; no manual retry needed.",
+ "info",
+ );
+ } else {
+ notify(
+ c,
+ "Review retry needs the original feedback string - please re-run /harvest review <feedback>.",
+ "info",
+ );
+ }
+ return;
+ }
+
  if (trimmed === "review" || trimmed.startsWith("review ")) {
  const feedback = rawArgs.replace(/^review\s*/i, "").trim();
  if (!feedback) {
