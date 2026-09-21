@@ -50,8 +50,8 @@ import type {
  NeatSlice,
  SessionEntry,
  VerifierAudit,
- VerifierUnavailableError,
 } from "./types.js";
+import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Minimal runtime interfaces (declared locally so the package builds
@@ -337,7 +337,16 @@ export default function (pi: ExtensionAPI): void {
  navigateTree: typeof ctx.navigateTree === "function" ? ctx.navigateTree.bind(ctx) : undefined,
  }, ctx);
  } catch (err) {
- const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (err instanceof VerifierConfigError) {
+ // Configuration error - no point retrying. Show a one-shot helpful
+ // message and unlock state. We deliberately do NOT call
+ // recordFailure() here because the user is being informed directly
+ // via the notify; persisting it in lastError would mask subsequent
+ // legitimate failures.
+ notify(ctx, "Audit skipped — " + err.message + " Set them in your shell, .env, or pi's launch config and try /harvest audit again.", "warning");
+ compilerFailStreak = 0;
+ } else {
+ const isUnavailable = err instanceof VerifierUnavailableError;
  const cause = recordFailure(ctx, "audit", err);
  if (isUnavailable) {
  notify(ctx, "Audit failed after retries: " + cause + ". Unlocking state; run /harvest audit to retry.", "warning");
@@ -345,6 +354,7 @@ export default function (pi: ExtensionAPI): void {
  compilerFailStreak = 0;
  } else {
  notify(ctx, "Audit failed: " + cause + " (unlocking state)", "warn");
+ }
  }
  // The finally block below handles state + auditInFlight cleanup.
  } finally {
@@ -890,12 +900,16 @@ export default function (pi: ExtensionAPI): void {
  notify(c, "Review sendUserMessage failed: " + msg, "warn");
  }
  } catch (err) {
- const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (err instanceof VerifierConfigError) {
+ notify(c, "Review skipped — " + err.message + " Set them in your shell, .env, or pi's launch config.", "warning");
+ } else {
+ const isUnavailable = err instanceof VerifierUnavailableError;
  const cause = recordFailure(c, "review", err);
  if (isUnavailable) {
  notify(c, "Review aborted after retries: " + cause + ". Unlocking state; run /harvest review again to retry.", "warning");
  } else {
  notify(c, "Review failed: " + cause + " (unlocking state)", "warn");
+ }
  }
  state = "idle";
  lastAudit = null;
@@ -1004,12 +1018,16 @@ export default function (pi: ExtensionAPI): void {
  notify(c, "Opinion sendUserMessage failed: " + msg, "warn");
  }
  } catch (err) {
- const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (err instanceof VerifierConfigError) {
+ notify(c, "Opinion skipped — " + err.message + " Set them in your shell, .env, or pi's launch config.", "warning");
+ } else {
+ const isUnavailable = err instanceof VerifierUnavailableError;
  const cause = recordFailure(c, "opinion", err);
  if (isUnavailable) {
  notify(c, "Opinion aborted after retries: " + cause + ". Unlocking state; run /harvest opinion again to retry.", "warning");
  } else {
  notify(c, "Opinion failed: " + cause + " (unlocking state)", "warn");
+ }
  }
  state = "idle";
  lastAudit = null;
@@ -1066,7 +1084,13 @@ export default function (pi: ExtensionAPI): void {
  harvestCount += 1;
  notify(c, "Distilled DPO pair saved (" + distilled.distilled_chosen_completion.length + " chars chosen)", "info");
  } catch (err) {
- const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ if (err instanceof VerifierConfigError) {
+ // Distillation is background/non-blocking; silently vamoose on config
+ // error so we don't spam the user mid-session. One-shot warning is
+ // enough - the user will see it once and can fix it at their leisure.
+ notify(c, "Distillation skipped: " + err.message, "info");
+ } else {
+ const isUnavailable = err instanceof VerifierUnavailableError;
  const cause = recordFailure(c, "distillation", err);
  notify(
  c,
@@ -1075,6 +1099,7 @@ export default function (pi: ExtensionAPI): void {
  : "Distillation failed: " + cause,
  "warn",
  );
+ }
  } finally {
  distillationInFlight = null;
  // Reset the thrashing window so we don't immediately retrigger.

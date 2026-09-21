@@ -9,7 +9,7 @@
  */
 
 import type { NeatSlice, VerifierAudit, ActiveFile } from "./types.js";
-import { VerifierUnavailableError } from "./types.js";
+import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
 import { buildVerifierPayload } from "./slice.js";
 
 const REQUIRED_FIELDS: (keyof VerifierAudit)[] = [
@@ -49,14 +49,20 @@ function readEnv(): { baseUrl: string; apiKey: string; model: string; timeoutMs:
  const model = process.env.VERIFIER_MODEL ?? "";
  const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? "300000");
  const retries = Number(process.env.HARVEST_MAX_RETRIES ?? "2");
- if (!baseUrl) throw new Error("VERIFIER_BASE_URL is not set");
- if (!apiKey) throw new Error("VERIFIER_API_KEY is not set");
- if (!model) throw new Error("VERIFIER_MODEL is not set");
+ // Missing required env vars throw VerifierConfigError (not a bare
+ // Error) so callers can distinguish "the verifier is down" from
+ // "the verifier isn't configured yet" and surface a helpful hint
+ // instead of a misleading "after retries" error message.
+ const missing: string[] = [];
+ if (!baseUrl) missing.push("VERIFIER_BASE_URL");
+ if (!apiKey) missing.push("VERIFIER_API_KEY");
+ if (!model) missing.push("VERIFIER_MODEL");
+ if (missing.length > 0) throw new VerifierConfigError(missing);
  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
- throw new Error("HARVEST_TIMEOUT_MS must be a positive number");
+ throw new VerifierConfigError(["HARVEST_TIMEOUT_MS (must be a positive number)"]);
  }
  if (!Number.isFinite(retries) || retries < 0) {
- throw new Error("HARVEST_MAX_RETRIES must be >= 0");
+ throw new VerifierConfigError(["HARVEST_MAX_RETRIES (must be >= 0)"]);
  }
  return { baseUrl, apiKey, model, timeoutMs, retries };
 }

@@ -512,3 +512,146 @@ test("invokeOpinion: retries on 503 and eventually throws VerifierUnavailableErr
  server.close();
  }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8.1: VerifierConfigError (graceful failure when env is missing)
+// ---------------------------------------------------------------------------
+
+import type { VerifierConfigError } from "../dist/types.js";
+
+test("invokeVerifier: throws VerifierConfigError when VERIFIER_BASE_URL is missing", async () => {
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ delete process.env.VERIFIER_BASE_URL;
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ try {
+ await assert.rejects(
+ () => verifier.invokeVerifier(FAKE_SLICE as any),
+ (err: unknown) => err instanceof Error && err.name === "VerifierConfigError" && /VERIFIER_BASE_URL/.test((err as Error).message),
+ );
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});
+
+test("invokeVerifier: throws VerifierConfigError when ALL three env vars are missing", async () => {
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ delete process.env.VERIFIER_BASE_URL;
+ delete process.env.VERIFIER_API_KEY;
+ delete process.env.VERIFIER_MODEL;
+ try {
+ await assert.rejects(
+ () => verifier.invokeVerifier(FAKE_SLICE as any),
+ (err: unknown) => {
+ if (!(err instanceof Error) || err.name !== "VerifierConfigError") return false;
+ const msg = (err as Error).message;
+ return /VERIFIER_BASE_URL/.test(msg) && /VERIFIER_API_KEY/.test(msg) && /VERIFIER_MODEL/.test(msg);
+ },
+ );
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});
+
+test("invokeDistiller: throws VerifierConfigError when VERIFIER_API_KEY is missing", async () => {
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ process.env.VERIFIER_BASE_URL = "https://example.test";
+ delete process.env.VERIFIER_API_KEY;
+ process.env.VERIFIER_MODEL = "m";
+ try {
+ await assert.rejects(
+ () => verifier.invokeDistiller({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [] }),
+ (err: unknown) => err instanceof Error && err.name === "VerifierConfigError" && /VERIFIER_API_KEY/.test((err as Error).message),
+ );
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});
+
+test("invokeReviewer: throws VerifierConfigError when VERIFIER_MODEL is missing", async () => {
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ process.env.VERIFIER_BASE_URL = "https://example.test";
+ process.env.VERIFIER_API_KEY = "k";
+ delete process.env.VERIFIER_MODEL;
+ try {
+ await assert.rejects(
+ () => verifier.invokeReviewer({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [], humanFeedback: "x" }),
+ (err: unknown) => err instanceof Error && err.name === "VerifierConfigError" && /VERIFIER_MODEL/.test((err as Error).message),
+ );
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});
+
+test("invokeOpinion: throws VerifierConfigError when VERIFIER_BASE_URL is missing", async () => {
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ delete process.env.VERIFIER_BASE_URL;
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ try {
+ await assert.rejects(
+ () => verifier.invokeOpinion({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [], optionalQuery: "x" }),
+ (err: unknown) => err instanceof Error && err.name === "VerifierConfigError" && /VERIFIER_BASE_URL/.test((err as Error).message),
+ );
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});
+
+test("VerifierConfigError: does NOT attempt any HTTP retries (no mock server needed)", async () => {
+ // Save env state
+ const saved = {
+ baseUrl: process.env.VERIFIER_BASE_URL,
+ key: process.env.VERIFIER_API_KEY,
+ model: process.env.VERIFIER_MODEL,
+ };
+ delete process.env.VERIFIER_BASE_URL;
+ delete process.env.VERIFIER_API_KEY;
+ delete process.env.VERIFIER_MODEL;
+ try {
+ // No mock server is started; if retry logic kicks in, this would
+ // hang trying to reach a non-existent endpoint. Fail-fast is the test.
+ const start = Date.now();
+ await assert.rejects(
+ () => verifier.invokeVerifier(FAKE_SLICE as any),
+ (err: unknown) => err instanceof Error && err.name === "VerifierConfigError",
+ );
+ const elapsed = Date.now() - start;
+ // Should fail in <100ms (sync env check), not after retries + backoff
+ assert.ok(elapsed < 200, "VerifierConfigError must fail fast, took " + elapsed + "ms");
+ } finally {
+ if (saved.baseUrl) process.env.VERIFIER_BASE_URL = saved.baseUrl;
+ if (saved.key) process.env.VERIFIER_API_KEY = saved.key;
+ if (saved.model) process.env.VERIFIER_MODEL = saved.model;
+ }
+});

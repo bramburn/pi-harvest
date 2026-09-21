@@ -171,3 +171,24 @@ export class VerifierUnavailableError extends Error {
  this.name = "VerifierUnavailableError";
  }
 }
+
+/**
+ * Thrown by any invoke*() function when the VERIFIER_BASE_URL,
+ * VERIFIER_API_KEY, or VERIFIER_MODEL env vars are missing or
+ * malformed. Distinct from VerifierUnavailableError so callers can
+ * surface a configuration-helpful message ("set your env vars") rather
+ * than a "verifier is down" error. Never retried — retries cannot fix
+ * a missing env var.
+ */
+export class VerifierConfigError extends Error {
+ constructor(
+ public readonly missing: string[],
+ ) {
+ super(
+ "Verifier not configured. Missing env vars: " +
+ missing.join(", ") +
+ ". See .env.example or README for the full list.",
+ );
+ this.name = "VerifierConfigError";
+ }
+}
