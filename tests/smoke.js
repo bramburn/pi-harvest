@@ -31,6 +31,10 @@ async function startMockVerifier(responder) {
  });
 }
 
+// mock-only fixture using legacy { toolName, output } shape; real pi
+// emits ToolResultEvent with content: Array<TextContent | ImageContent>
+// and this scenario exercises the legacy fallback branch of
+// extractToolResultText only.
 function makePi() {
  const handlers = {};
  const calls = { sendUserMessage: [], navigateTree: [] };
