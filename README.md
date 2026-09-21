@@ -1,13 +1,14 @@
 # pi-harvest
 
-> Trajectory harvester for [`pi.dev`](https://pi.dev) — watches local worker runs, intercepts compile-failure loops, audits them with an out-of-band verifier, captures active-file context, and ships monthly-rotated DPO/SFT records plus a native HuggingFace `trl`-compatible exporter.
+> Trajectory harvester for [`pi.dev`](https://pi.dev) — watches local worker runs, intercepts compile-failure loops, audits them with an out-of-band verifier, captures active-file context, ships monthly-rotated DPO/SFT records, and distills multi-turn thrashing into optimal 1-turn training pairs.
 
-`pi-harvest` is a `pi.dev` extension with four phases:
+`pi-harvest` is a `pi.dev` extension with five phases:
 
 - **Phase 1 — telemetry.** Bash-output compiler-failure scanning, TUI status widget, warn-level notifications when thresholds trip.
 - **Phase 2 — Neat Slice + audit + splice + DPO sink.** Threshold trip → extract *Neat Slice* → POST to OpenAI-compatible Verifier → rewind via `navigateTree` → inject `[STEER:K3]` → write DPO JSONL on resolution.
 - **Phase 3 — production hardening.** Active-file capture with 300-line / 12 KB clamps, domain taxonomy tagging, verifier retries with exponential backoff (1 s → 2 s), full `HarvestedTrajectoryRecord` schema, `/harvest status` + `/harvest audit` slash commands.
 - **Phase 4 — data lifecycle + diff-awareness + native export.** Monthly sink rotation (`trajectories_YYYY_MM.jsonl`), `git diff --unified=3` capture (200-line clamp), `/harvest export dpo` slash command that streams every sink into a HuggingFace conversational DPO file under `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`, top-3 flaw-category telemetry in `/harvest status`.
+- **Phase 5 — Trajectory Distillation (Thrashing Detection).** When the worker spends 6+ tool calls in a single turn and repeatedly edits the same files before producing a clean compile, the extension fires a background distillation call (does NOT pause the user). K3 is asked to write the optimal single-turn response that achieves the same result; the rejected text (the messy multi-turn thrash) and the K3-distilled chosen text are saved as a DPO pair with `trigger_reason: "thrashing_distillation"`.
 
 ## TUI widget
 
@@ -232,7 +233,61 @@ tests/
 - **Phase 2** ✅ — Neat Slice, out-of-band Verifier call, splice, DPO sink.
 - **Phase 3** ✅ — workspace capture, domain taxonomy, retry/backoff, full DPO/SFT schema, slash commands.
 - **Phase 4** ✅ — monthly rotation, git diffs, HF DPO exporter, telemetry aggregation.
-- **Phase 5** — multi-verifier consensus, streaming upload to S3/OSS.
+- **Phase 5** ✅ — trajectory distillation: thrashing detection + background K3 distillation + DPO pair with `trigger_reason: "thrashing_distillation"`.
+- **Phase 6** — multi-verifier consensus, streaming upload to S3/OSS.
+
+## Phase 5: thrashing detection in detail
+
+The Phase 3 audit only fires on **compile failures**. Phase 5 catches **inefficiency**: when the worker succeeds after a long sequence of edits to the same files, that's a high-value training signal — "the worker could have done this in one shot."
+
+### Trigger
+
+In `turn_end`, when:
+1. `toolResults.length >= HARVEST_THRASHING_THRESHOLD` (default `6`)
+2. The final tool result was a clean bash (no compiler signature)
+3. At least one file was edited 2+ times during the turn (rework signal — distinguishes planned scaffolding from thrashing)
+
+### Behaviour
+
+- Fire-and-forget. The user's interactive session is **never paused** — distillation runs in a background Promise.
+- A `thrashingStreak` counter accumulates tool-call counts across consecutive thrashing turns, then resets when any of the three trigger conditions fail.
+- `distillationInFlight` prevents stacking; only one distillation runs at a time.
+- On any verifier error (including exhaustion), the streak is reset and a `warn` notification is emitted — the session continues.
+
+### DPO record
+
+```json
+{
+ "trigger_reason": "thrashing_distillation",
+ "immediate_prompt": "the original user task that started the thrash",
+ "rejected_completion": "concatenated assistant text across the thrashing turns",
+ "chosen_completion": "the K3-distilled optimal single-turn response",
+ "k3_audit": { "flaw_category": "thrashing", ... }
+}
+```
+
+### Distiller prompt mode
+
+`invokeDistiller({cwd, slice, activeFiles})` uses a different system prompt than the error auditor:
+
+> You are a Principal Software Architect. The junior worker model took an inefficient, multi-turn trial-and-error path to arrive at the working code provided in the active files. Your task is Hindsight Relabeling. Write the optimal, single-turn assistant response that provides this exact solution directly and elegantly, as if it got it right on the first try.
+
+The response schema is strict:
+
+```json
+{ "distilled_chosen_completion": "string" }
+```
+
+Same retry/backoff policy as the error auditor (`HARVEST_MAX_RETRIES`, 1 s → 2 s exponential backoff, `response_format: json_object`, markdown fence stripping).
+
+## Roadmap
+
+- **Phase 1** ✅ — scaffolding, hooks, status widget, publishing pipeline.
+- **Phase 2** ✅ — Neat Slice, out-of-band Verifier call, splice, DPO sink.
+- **Phase 3** ✅ — workspace capture, domain taxonomy, retry/backoff, full DPO/SFT schema, slash commands.
+- **Phase 4** ✅ — monthly rotation, git diffs, HF DPO exporter, telemetry aggregation.
+- **Phase 5** ✅ — trajectory distillation.
+- **Phase 6** — multi-verifier consensus, streaming upload to S3/OSS.
 
 ## License
 

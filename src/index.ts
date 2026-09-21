@@ -25,7 +25,7 @@
 
 import { writeDpoEntry, getSinkStats, currentSinkPath } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
-import { invokeVerifier } from "./verifier.js";
+import { invokeVerifier, invokeDistiller } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
 import { exportToHuggingFaceDPO } from "./exporter.js";
@@ -57,6 +57,18 @@ interface PiContext {
  getSessionId(): string;
  };
  [key: string]: unknown;
+}
+
+/**
+ * Loose shape for the per-tool results bundled into a TurnEndEvent.
+ * The full ToolResultMessage type lives in @earendil-works/pi-ai.
+ */
+interface LooseToolResult {
+ toolName?: string;
+ toolCallId?: string;
+ details?: unknown;
+ content?: Array<{ type?: string; text?: string }> | string;
+ isError?: boolean;
 }
 
 interface ExtensionAPI {
@@ -108,6 +120,7 @@ const SIGNATURE_REGEX = new RegExp(
 
 const TURN_INTERVAL = Number(process.env.HARVEST_TURN_INTERVAL ?? "30");
 const STREAK_THRESHOLD = Number(process.env.HARVEST_STREAK_THRESHOLD ?? "3");
+const THRASHING_THRESHOLD = Number(process.env.HARVEST_THRASHING_THRESHOLD ?? "6");
 const STATUS_KEY = "harvester";
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
@@ -132,6 +145,19 @@ export default function (pi: ExtensionAPI): void {
  let lastDivergenceEntryId: string | null = null;
  let lastGitDiffSummary: string | null = null;
  let auditInFlight: Promise<void> | null = null;
+
+ // Phase 5: thrashing streak counter — number of consecutive turn_ends
+ // where (a) toolResults.length >= THRASHING_THRESHOLD, (b) the final tool
+ // result was a clean bash success, AND (c) at least one file was edited
+ // 2+ times during the turn (rework signal — the mitigation for the
+ // failing criterion about planned scaffolding). Resets when any of the
+ // three conditions fail.
+ let thrashingStreak = 0;
+ // Captured text for the active thrash window — concatenated assistant
+ // messages across the streak, used as `rejected_completion` in the
+ // eventual distillation DPO record.
+ let thrashingRejectedText = "";
+ let distillationInFlight: Promise<void> | null = null;
 
  // -------------------------------------------------------------------------
  // Helpers
@@ -384,6 +410,192 @@ export default function (pi: ExtensionAPI): void {
  });
 
  // -------------------------------------------------------------------------
+ // Phase 5: Thrashing detection + background distillation
+ // -------------------------------------------------------------------------
+
+ /**
+ * Extract a file path from a ToolResult's details or text content.
+ * Returns null if no path-like token is found.
+ */
+ function extractPathFromToolResult(tr: LooseToolResult): string | null {
+ const details = tr.details as Record<string, unknown> | undefined;
+ if (details && typeof details === "object") {
+ const candidates = [details.path, (details as any).filePath, (details as any).file];
+ for (const c of candidates) {
+ if (typeof c === "string" && c.length > 0) return c;
+ }
+ }
+ const content = tr.content;
+ if (typeof content === "string") {
+ const m = content.match(/([\w./\\-]+\.[a-zA-Z0-9]{1,5})/);
+ if (m) return m[1];
+ }
+ if (Array.isArray(content)) {
+ for (const part of content) {
+ if (typeof part === "object" && part !== null) {
+ const txt = (part as { text?: string }).text;
+ if (typeof txt === "string") {
+ const m = txt.match(/([\w./\\-]+\.[a-zA-Z0-9]{1,5})/);
+ if (m) return m[1];
+ }
+ }
+ }
+ }
+ return null;
+ }
+
+ /**
+ * Was the given tool result a clean bash output (no compiler error signature)?
+ */
+ function isCleanBashResult(tr: LooseToolResult): boolean {
+ const toolName = (tr.toolName ?? "").toLowerCase();
+ if (toolName !== "bash" && toolName !== "run_shell" && toolName !== "shell") return false;
+ if (tr.isError === true) return false;
+ const content = tr.content;
+ let haystack = "";
+ if (typeof content === "string") haystack = content;
+ else if (Array.isArray(content)) haystack = content.map((p) => p.text ?? "").join("\n");
+ haystack = haystack.toLowerCase();
+ if (!haystack) return false;
+ return !SIGNATURE_REGEX.test(haystack);
+ }
+
+ /**
+ * Detect thrashing in the current turn and trigger background distillation.
+ *
+ * Signal:
+ * - toolResults.length >= THRASHING_THRESHOLD
+ * - last tool result was a clean bash (success)
+ * - at least one file was edited 2+ times during the turn (rework signal)
+ *
+ * Non-blocking — runs the distiller in a fire-and-forget Promise so the
+ * user's interactive session is never paused.
+ */
+ function maybeDetectThrashing(ctx: PiContext, event: any): void {
+ if (distillationInFlight) return; // already running
+
+ const toolResults: LooseToolResult[] = Array.isArray(event?.toolResults) ? event.toolResults : [];
+
+ // Reset by default; only re-evaluate below.
+ const prevStreak = thrashingStreak;
+ const prevText = thrashingRejectedText;
+ thrashingStreak = 0;
+ thrashingRejectedText = "";
+
+ if (THRASHING_THRESHOLD <= 0) return;
+ if (toolResults.length < THRASHING_THRESHOLD) return;
+
+ const lastResult = toolResults[toolResults.length - 1];
+ if (!isCleanBashResult(lastResult)) return;
+
+ // Count file-edit occurrences across this turn's tool calls.
+ const pathCounts = new Map<string, number>();
+ for (const tr of toolResults) {
+ const toolName = (tr.toolName ?? "").toLowerCase();
+ if (toolName !== "write" && toolName !== "edit" && toolName !== "patch") continue;
+ const p = extractPathFromToolResult(tr);
+ if (!p) continue;
+ pathCounts.set(p, (pathCounts.get(p) ?? 0) + 1);
+ }
+ const reworked = Array.from(pathCounts.entries()).filter(([, c]) => c >= 2);
+ if (reworked.length === 0) return; // planned scaffolding, not thrashing
+
+ // We have a thrashing turn. The streak accumulates the tool-call count
+ // across consecutive thrashing turns so a single 7-tool-call thrash
+ // immediately trips the 6-tool threshold (rather than needing 6
+ // separate turns).
+ thrashingStreak = prevStreak + toolResults.length;
+
+ // Append assistant messages from this turn to the rejected text window.
+ try {
+ const branch = ctx.sessionManager.getBranch();
+ for (const entry of branch) {
+ if (entry.type === "message" && (entry.message as { role?: string }).role === "assistant") {
+ thrashingRejectedText += messageToText(entry.message as never) + "\n\n";
+ }
+ }
+ } catch {
+ // Defensive: if branch inspection fails, just use the previous text.
+ thrashingRejectedText = prevText + "\n\n";
+ }
+
+ notify(
+ ctx,
+ "Thrashing detected: " + thrashingStreak + " turn(s) with " + reworked.length + " reworked file(s)",
+ "info",
+ );
+
+ if (thrashingStreak >= THRASHING_THRESHOLD) {
+ triggerDistillation(ctx);
+ }
+ }
+
+ /**
+ * Fire-and-forget distillation. Does NOT block turn_end; errors are
+ * caught and reported via notify so a flaky verifier never crashes the
+ * session.
+ */
+ function triggerDistillation(ctx: PiContext): void {
+ const c = ctx as PiContext;
+ const branch = ctx.sessionManager.getBranch();
+ const slice = extractNeatSlice(branch, c.cwd);
+ const rejectedText = thrashingRejectedText || slice.failedCode || "";
+
+ notify(
+ c,
+ "Distilling " + thrashingStreak + "+ turn thrash into an optimal DPO pair...",
+ "info",
+ );
+
+ distillationInFlight = (async () => {
+ try {
+ const activeFiles = await captureActiveFileStates(c.cwd, slice.modifiedPaths);
+ const distilled = await invokeDistiller({ cwd: c.cwd, slice, activeFiles });
+ writeDpoEntry({
+ audit: {
+ inferred_subtask: "thrashing_distillation",
+ divergence_detected: false,
+ flaw_category: "thrashing",
+ root_cause: "",
+ discard_advice: "",
+ steering_instructions: "",
+ domain_tags: inferDomainTags(slice.modifiedPaths),
+ },
+ slice,
+ chosenCompletion: distilled.distilled_chosen_completion,
+ rejectedCompletion: rejectedText,
+ ctx: c as never,
+ domainTags: inferDomainTags(slice.modifiedPaths),
+ workerModel: workerModelId(c),
+ verifierModel: process.env.VERIFIER_MODEL ?? "unknown",
+ triggerReason: "thrashing_distillation",
+ divergenceEntryId: null,
+ activeFiles,
+ gitDiffSummary: extractGitDiff(c.cwd),
+ });
+ harvestCount += 1;
+ notify(c, "Distilled DPO pair saved (" + distilled.distilled_chosen_completion.length + " chars chosen)", "info");
+ } catch (err) {
+ const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
+ const msg = (err as Error)?.message ?? String(err);
+ notify(
+ c,
+ isUnavailable
+ ? "Distillation skipped — verifier unavailable (continuing unblocked)"
+ : "Distillation failed: " + msg,
+ "warn",
+ );
+ } finally {
+ distillationInFlight = null;
+ // Reset the thrashing window so we don't immediately retrigger.
+ thrashingStreak = 0;
+ thrashingRejectedText = "";
+ paint(c);
+ }
+ })();
+ }
+
+ // -------------------------------------------------------------------------
  // Hooks
  // -------------------------------------------------------------------------
 
@@ -410,7 +622,7 @@ export default function (pi: ExtensionAPI): void {
  paint(c);
  });
 
- pi.on("turn_end", (_event, ctx) => {
+ pi.on("turn_end", (event, ctx) => {
  const c = ctx as PiContext;
  turnCounter += 1;
 
@@ -432,6 +644,10 @@ export default function (pi: ExtensionAPI): void {
  runAudit(c, streakHit ? "compiler_streak" : "periodic_turn");
  }
  }
+
+ // 3) Phase 5: thrashing detection. Runs after the audit/splice logic
+ // so it never competes with state transitions. Non-blocking.
+ maybeDetectThrashing(c, event);
 
  paint(c);
  });

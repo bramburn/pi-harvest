@@ -1,6 +1,6 @@
 {
   "name": "pi-harvest",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Trajectory harvester extension for pi.dev — monitors local worker model runs and intercepts compilation failure loops.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

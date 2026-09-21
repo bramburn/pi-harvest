@@ -8,7 +8,7 @@
  * callers should catch and reset state rather than crash.
  */
 
-import type { NeatSlice, VerifierAudit } from "./types.js";
+import type { NeatSlice, VerifierAudit, ActiveFile } from "./types.js";
 import { VerifierUnavailableError } from "./types.js";
 import { buildVerifierPayload } from "./slice.js";
 
@@ -207,6 +207,229 @@ class RetryableHttpError extends Error {
  super("HTTP " + status + ": " + message);
  this.name = "RetryableHttpError";
  }
+}
+
+// ============================================================================
+// Distiller (Phase 5): compress multi-turn thrashing into optimal 1-turn
+// response. Non-blocking; called from background promise.
+// ============================================================================
+
+const DISTILLER_SYSTEM_PROMPT = [
+ "You are a Principal Software Architect.",
+ "The junior worker model took an inefficient, multi-turn trial-and-error path to arrive at the working code provided in the active files.",
+ "Your task is Hindsight Relabeling.",
+ "Write the optimal, single-turn assistant response that provides this exact solution directly and elegantly, as if it got it right on the first try.",
+ "",
+ "Constraints:",
+ "- The distilled response should be the code + a brief explanation, as a single assistant message.",
+ "- Preserve correctness — the solution must be byte-equivalent in behavior to the working code.",
+ "- Strip out false starts, debugging chatter, and intermediate edits.",
+ "- Do NOT introduce new dependencies, APIs, or files that weren't in the working code.",
+ "",
+ "Return JSON only with this exact shape and no other keys:",
+ JSON.stringify({
+ distilled_chosen_completion: "string — the optimal single-turn assistant response (code + brief prose)",
+ }, null, 2),
+ "",
+ "Return JSON only. Do not wrap it in markdown fences. Do not add prose.",
+].join("\n");
+
+/**
+ * Strict schema for the distiller response.
+ */
+export interface DistillerResponse {
+ distilled_chosen_completion: string;
+}
+
+/**
+ * Validate a distiller response. Throws on mismatch.
+ */
+export function validateDistillerResponse(value: unknown): DistillerResponse {
+ if (!value || typeof value !== "object" || Array.isArray(value)) {
+ throw new Error("Distiller response is not a JSON object");
+ }
+ const obj = value as Record<string, unknown>;
+ if (typeof obj.distilled_chosen_completion !== "string") {
+ throw new Error("Distiller response: distilled_chosen_completion must be a string");
+ }
+ return obj as unknown as DistillerResponse;
+}
+
+/**
+ * Build the user payload for the distiller. Unlike the error auditor,
+ * this payload leads with the working active files (the ground truth)
+ * followed by the thrash transcript for context.
+ */
+export function buildDistillerPayload(opts: { slice: NeatSlice; activeFiles: ActiveFile[] }): string {
+ const parts: string[] = [];
+
+ if (opts.activeFiles.length > 0) {
+ parts.push("=== WORKING CODE (ground truth) ===");
+ for (const f of opts.activeFiles) {
+ if (!f || typeof f !== "object") continue;
+ const path = typeof f.path === "string" ? f.path : "?";
+ const skipped = typeof f.skipped === "string" ? f.skipped : undefined;
+ if (skipped) {
+ parts.push("--- " + path + " ---");
+ parts.push("(skipped: " + skipped + ")");
+ continue;
+ }
+ const content = typeof f.content === "string" ? f.content : "";
+ parts.push("--- " + path + " ---");
+ parts.push(content || "(empty)");
+ }
+ } else {
+ parts.push("=== WORKING CODE ===");
+ parts.push("(no active files captured)");
+ }
+
+ if (opts.slice.inceptionPrompt) {
+ parts.push("\n=== ORIGINAL TASK ===");
+ parts.push(opts.slice.inceptionPrompt);
+ }
+
+ if (opts.slice.sliceEntries.length > 0) {
+ parts.push("\n=== THRASH TRANSCRIPT (for context — do not echo verbatim) ===");
+ for (let i = 0; i < opts.slice.sliceEntries.length; i++) {
+ const entry = opts.slice.sliceEntries[i];
+ const role = entry.type === "message" ? (entry.message?.role ?? entry.type) : entry.type;
+ const text = entryToTextForDistiller(entry);
+ parts.push("=== TURN " + (i + 1) + " (" + role + ") ===");
+ parts.push(text || "(empty)");
+ }
+ }
+
+ const joined = parts.join("\n\n");
+ return enforcePayloadSizeInternal(joined, 64 * 1024);
+}
+
+function entryToTextForDistiller(entry: any): string {
+ if (!entry || typeof entry !== "object") return "";
+ if (entry.type === "message") {
+ return messageToTextInternal(entry.message);
+ }
+ if (entry.type === "custom_message") {
+ const c = entry.content;
+ if (typeof c === "string") return c;
+ if (Array.isArray(c)) {
+ return c.map((p) => (typeof p === "string" ? p : p?.text ?? p?.content ?? "")).filter(Boolean).join("\n");
+ }
+ }
+ return "";
+}
+
+function messageToTextInternal(msg: any): string {
+ if (!msg) return "";
+ const c = msg.content;
+ if (typeof c === "string") return c;
+ if (Array.isArray(c)) {
+ return c.map((p) => (typeof p === "string" ? p : (p && typeof p === "object" ? (p.text ?? p.content ?? "") : ""))).filter(Boolean).join("\n");
+ }
+ return "";
+}
+
+function enforcePayloadSizeInternal(payload: string, maxBytes: number): string {
+ if (Buffer.byteLength(payload, "utf8") <= maxBytes) return payload;
+ const buf = Buffer.from(payload, "utf8");
+ const sliced = buf.subarray(0, maxBytes).toString("utf8");
+ const lastNewline = sliced.lastIndexOf("\n");
+ const cut = lastNewline > 0 ? sliced.slice(0, lastNewline) : sliced;
+ return cut + "\n\n[... payload clamped to " + maxBytes + " bytes ...]";
+}
+
+async function distillerAttemptOnce(
+ opts: { baseUrl: string; apiKey: string; model: string; timeoutMs: number },
+ payload: { slice: NeatSlice; activeFiles: ActiveFile[] },
+ attempt: number,
+): Promise<DistillerResponse> {
+ const userContent = buildDistillerPayload(payload);
+ const body = {
+ model: opts.model,
+ messages: [
+ { role: "system", content: DISTILLER_SYSTEM_PROMPT },
+ { role: "user", content: userContent },
+ ],
+ response_format: { type: "json_object" },
+ temperature: 0,
+ };
+
+ const controller = new AbortController();
+ const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+
+ let res: Response;
+ try {
+ res = await fetch(opts.baseUrl + "/chat/completions", {
+ method: "POST",
+ headers: {
+ "Content-Type": "application/json",
+ Authorization: "Bearer " + opts.apiKey,
+ },
+ body: JSON.stringify(body),
+ signal: controller.signal,
+ });
+ } catch (err) {
+ clearTimeout(timer);
+ const e = err as Error;
+ if (e.name === "AbortError") {
+ throw new Error("attempt " + attempt + ": timed out after " + opts.timeoutMs + "ms");
+ }
+ throw new Error("attempt " + attempt + ": network error: " + e.message);
+ }
+ clearTimeout(timer);
+
+ if (res.status === 429 || res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
+ throw new RetryableHttpError(res.status, res.statusText);
+ }
+ if (!res.ok) {
+ const text = await res.text().catch(() => "");
+ throw new Error("attempt " + attempt + ": HTTP " + res.status + ": " + text.slice(0, 500));
+ }
+
+ const parsed = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+ const content = parsed?.choices?.[0]?.message?.content;
+ if (typeof content !== "string" || content.length === 0) {
+ throw new Error("attempt " + attempt + ": empty content");
+ }
+
+ const cleaned = stripJsonFences(content);
+ let json: unknown;
+ try {
+ json = JSON.parse(cleaned);
+ } catch (err) {
+ throw new Error("attempt " + attempt + ": JSON.parse failed: " + (err as Error).message);
+ }
+ return validateDistillerResponse(json);
+}
+
+/**
+ * Background distillation call (Phase 5). Same retry/backoff policy as
+ * the error auditor; throws VerifierUnavailableError when all retries
+ * fail (caller should swallow — distillation is non-blocking).
+ */
+export async function invokeDistiller(opts: {
+ cwd: string;
+ slice: NeatSlice;
+ activeFiles: ActiveFile[];
+}): Promise<DistillerResponse> {
+ const env = readEnv();
+ const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
+ const backoffMs = [1000, 2000];
+ let lastError: unknown = null;
+
+ for (let attempt = 0; attempt <= env.retries; attempt++) {
+ try {
+ return await distillerAttemptOnce(envOpts, opts, attempt + 1);
+ } catch (err) {
+ lastError = err;
+ const isRetryable =
+ err instanceof RetryableHttpError ||
+ (err instanceof Error && /timed out|network error|JSON\.parse failed/.test(err.message));
+ if (!isRetryable || attempt >= env.retries) break;
+ const delay = backoffMs[Math.min(attempt, backoffMs.length - 1)];
+ await sleep(delay);
+ }
+ }
+ throw new VerifierUnavailableError(env.retries + 1, lastError);
 }
 
 /**

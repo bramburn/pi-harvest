@@ -200,3 +200,115 @@ test("invokeVerifier: throws VerifierUnavailableError after all retries fail", a
  server.close();
  }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 5: Distiller
+// ---------------------------------------------------------------------------
+
+const VALID_DISTILL = {
+ distilled_chosen_completion: "fn main() { println!(\"hi\"); }",
+};
+
+test("validateDistillerResponse: accepts a valid object", () => {
+ const out = verifier.validateDistillerResponse(VALID_DISTILL);
+ assert.equal(out.distilled_chosen_completion, "fn main() { println!(\"hi\"); }");
+});
+
+test("validateDistillerResponse: rejects missing field", () => {
+ const bad = {};
+ assert.throws(() => verifier.validateDistillerResponse(bad), /distilled_chosen_completion/);
+});
+
+test("validateDistillerResponse: rejects wrong type", () => {
+ const bad = { distilled_chosen_completion: 123 };
+ assert.throws(() => verifier.validateDistillerResponse(bad), /must be a string/);
+});
+
+test("validateDistillerResponse: rejects non-object", () => {
+ assert.throws(() => verifier.validateDistillerResponse("string"), /not a JSON object/);
+ assert.throws(() => verifier.validateDistillerResponse(null), /not a JSON object/);
+});
+
+test("buildDistillerPayload: includes WORKING CODE and ORIGINAL TASK sections", () => {
+ const out = verifier.buildDistillerPayload({
+ slice: {
+ ...FAKE_SLICE,
+ inceptionPrompt: "build hello",
+ modifiedPaths: ["src/main.rs"],
+ },
+ activeFiles: [{ path: "src/main.rs", content: "fn main() {}", truncated: false }],
+ });
+ assert.match(out, /WORKING CODE/);
+ assert.match(out, /src\/main\.rs/);
+ assert.match(out, /fn main/);
+ assert.match(out, /ORIGINAL TASK/);
+ assert.match(out, /build hello/);
+});
+
+test("buildDistillerPayload: omits WORKING CODE when no active files", () => {
+ const out = verifier.buildDistillerPayload({
+ slice: { ...FAKE_SLICE, inceptionPrompt: "x" },
+ activeFiles: [],
+ });
+ assert.match(out, /no active files captured/);
+});
+
+test("invokeDistiller: parses a clean JSON response", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ const { server, baseUrl } = await startMock((_req, res) => {
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(VALID_DISTILL) } }] }));
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ const out = await verifier.invokeDistiller({
+ cwd: "/tmp",
+ slice: FAKE_SLICE as any,
+ activeFiles: [],
+ });
+ assert.equal(out.distilled_chosen_completion, VALID_DISTILL.distilled_chosen_completion);
+ } finally {
+ server.close();
+ }
+});
+
+test("invokeDistiller: retries on 503 and eventually throws VerifierUnavailableError", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ process.env.HARVEST_MAX_RETRIES = "1";
+ let hits = 0;
+ const { server, baseUrl } = await startMock((_req, res) => {
+ hits++;
+ res.writeHead(503, { "Content-Type": "text/plain" });
+ res.end("unavailable");
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ await assert.rejects(
+ () => verifier.invokeDistiller({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [] }),
+ (err: unknown) => err instanceof VerifierUnavailableError,
+ );
+ assert.equal(hits, 2, "should have tried 1 + 1 retry");
+ } finally {
+ delete process.env.HARVEST_MAX_RETRIES;
+ server.close();
+ }
+});
+
+test("invokeDistiller: strips markdown fences before parsing", async () => {
+ process.env.VERIFIER_API_KEY = "k";
+ process.env.VERIFIER_MODEL = "m";
+ const wrapped = "```json\n" + JSON.stringify(VALID_DISTILL) + "\n```";
+ const { server, baseUrl } = await startMock((_req, res) => {
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: wrapped } }] }));
+ });
+ process.env.VERIFIER_BASE_URL = baseUrl;
+ try {
+ const out = await verifier.invokeDistiller({ cwd: "/tmp", slice: FAKE_SLICE as any, activeFiles: [] });
+ assert.match(out.distilled_chosen_completion, /println/);
+ } finally {
+ server.close();
+ }
+});
