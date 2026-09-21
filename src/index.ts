@@ -38,7 +38,7 @@
  */
 
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
-import { extractNeatSlice, messageToText } from "./slice.js";
+import { extractNeatSlice, messageToText, extractToolResultText } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
@@ -1116,7 +1116,7 @@ export default function (pi: ExtensionAPI): void {
 
  pi.on("tool_result", (event, ctx) => {
  const c = ctx as PiContext;
- const e = event as { toolName?: string; output?: string; stdout?: string; stderr?: string };
+ const e = event as { toolName?: string; isError?: boolean };
 
  const toolName = (e.toolName ?? "").toLowerCase();
  if (toolName && toolName !== "bash" && toolName !== "run_shell" && toolName !== "shell") {
@@ -1124,8 +1124,7 @@ export default function (pi: ExtensionAPI): void {
  return;
  }
 
- const raw =
- [e.output, e.stdout, e.stderr].filter((s): s is string => typeof s === "string").join("\n") || "";
+ const raw = extractToolResultText(event);
  const haystack = raw.toLowerCase();
 
  if (haystack && SIGNATURE_REGEX.test(haystack)) {

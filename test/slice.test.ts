@@ -181,3 +181,79 @@ test("entryIdForDivergenceTurn: returns null for invalid input", () => {
  assert.equal(slice.entryIdForDivergenceTurn(out, -1), null);
  assert.equal(slice.entryIdForDivergenceTurn(out, NaN), null);
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7 bugfix regression: real pi ToolResultEvent shape
+//
+// Real pi emits tool_result events with `content: Array<TextContent |
+// ImageContent>`, where each text part carries `.text`. The extension's
+// tool_result handler reads this array to detect compile failures and
+// drive Phase 7 SFT capture. Earlier the handler read undefined
+// `output`/`stdout`/`stderr` instead and silently never detected
+// anything. extractToolResultText is the pure helper that fixes it.
+// ---------------------------------------------------------------------------
+
+test("extractToolResultText: real pi shape with content[] (text + image)", () => {
+ const out = slice.extractToolResultText({
+ toolName: "bash",
+ isError: false,
+ content: [
+ { type: "text", text: "error[E0425]: cannot find value x" },
+ { type: "image", data: "abc", mimeType: "image/png" },
+ ],
+ });
+ assert.equal(out, "error[E0425]: cannot find value x");
+});
+
+test("extractToolResultText: multi-part content joins with newlines", () => {
+ const out = slice.extractToolResultText({
+ toolName: "bash",
+ content: [
+ { type: "text", text: "line one" },
+ { type: "text", text: "line two" },
+ ],
+ });
+ assert.equal(out, "line one\nline two");
+});
+
+test("extractToolResultText: legacy output/stdout/stderr shape still works", () => {
+ const out = slice.extractToolResultText({
+ toolName: "bash",
+ output: "from output",
+ stdout: "from stdout",
+ });
+ assert.match(out, /from output/);
+ assert.match(out, /from stdout/);
+});
+
+test("extractToolResultText: string content passes through", () => {
+ const out = slice.extractToolResultText({
+ toolName: "bash",
+ content: "direct string",
+ });
+ assert.equal(out, "direct string");
+});
+
+test("extractToolResultText: returns empty string for non-object / null", () => {
+ assert.equal(slice.extractToolResultText(null), "");
+ assert.equal(slice.extractToolResultText(undefined), "");
+ assert.equal(slice.extractToolResultText("string"), "");
+ assert.equal(slice.extractToolResultText(42), "");
+});
+
+test("extractToolResultText: empty content + empty legacy fields returns empty string", () => {
+ const out = slice.extractToolResultText({ toolName: "bash", content: [] });
+ assert.equal(out, "");
+});
+
+test("extractToolResultText: drops empty text parts but keeps non-empty ones", () => {
+ const out = slice.extractToolResultText({
+ toolName: "bash",
+ content: [
+ { type: "text", text: "" },
+ { type: "text", text: "real" },
+ { type: "text", text: "" },
+ ],
+ });
+ assert.equal(out, "real");
+});

@@ -307,3 +307,45 @@ export function entryIdForDivergenceTurn(
  const entry = slice.sliceEntries[idx];
  return entry?.id ?? null;
 }
+
+/**
+ * Extract the raw text output from a pi ToolResultEvent.
+ *
+ * Real pi's ToolResultEvent carries the bash output in
+ * `content: Array<TextContent | ImageContent>` where each text part
+ * has `.text`. Earlier versions of pi (and many tests) used a
+ * legacy `{ output, stdout, stderr }` shape on the top level. This
+ * helper accepts both so the tool_result handler can stay
+ * forward-compatible with real pi while still working with the
+ * existing test mock.
+ *
+ * Returns an empty string when no recognisable text can be extracted.
+ */
+export function extractToolResultText(event: unknown): string {
+ if (!event || typeof event !== "object") return "";
+ const e = event as {
+ content?: unknown;
+ output?: unknown;
+ stdout?: unknown;
+ stderr?: unknown;
+ };
+ const content = e.content;
+ if (typeof content === "string") return content;
+ if (Array.isArray(content)) {
+ return content
+ .map((p) => {
+ if (typeof p === "string") return p;
+ if (p && typeof p === "object") {
+ const t = (p as { text?: unknown }).text;
+ if (typeof t === "string") return t;
+ }
+ return "";
+ })
+ .filter((s) => s.length > 0)
+ .join("\n");
+ }
+ const legacy = [e.output, e.stdout, e.stderr]
+ .filter((s): s is string => typeof s === "string")
+ .join("\n");
+ return legacy;
+}
