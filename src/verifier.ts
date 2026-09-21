@@ -47,7 +47,7 @@ function readEnv(): { baseUrl: string; apiKey: string; model: string; timeoutMs:
  const baseUrl = process.env.VERIFIER_BASE_URL?.replace(/\/+$/, "") ?? "";
  const apiKey = process.env.VERIFIER_API_KEY ?? "";
  const model = process.env.VERIFIER_MODEL ?? "";
- const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? "30000");
+ const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? "300000");
  const retries = Number(process.env.HARVEST_MAX_RETRIES ?? "2");
  if (!baseUrl) throw new Error("VERIFIER_BASE_URL is not set");
  if (!apiKey) throw new Error("VERIFIER_API_KEY is not set");
