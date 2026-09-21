@@ -206,6 +206,20 @@ The plan's most-cited constraint: *"For every automated course correction, there
 
 If a future refactor needs a second LLM call (e.g. to summarize the K3 response, or to validate the corrected code), **that's a Phase 7+ problem**, not a Phase 2–6 assumption. Phase 2–6 stays at exactly one verifier call per audit.
 
+### Interaction with `@tintinweb/pi-subagents`
+
+When the parent session dispatches a subagent via `@tintinweb/pi-subagents` (or any extension that spawns child `AgentSession` instances via `createAgentSession`), pi-harvest **continues to work** without any code changes — but with these deliberate behavioral caveats:
+
+- **Hooks fire per-session, not globally.** Each subagent runs in its own `AgentSession` with its own `ExtensionRunner`. pi-harvest's `pi.on("tool_result")` and `pi.on("turn_end")` registrations land on the subagent's runner, so a 3-streak compiler failure inside a subagent triggers an audit *in that subagent's session*, not the parent's. This is the right behavior: the verifier should audit the worker that's drifting.
+- **State is per-subagent.** `compilerFailStreak` and `turnCounter` are module-locals in `src/index.ts`. Each subagent gets its own counter pair. The parent's UI shows only the parent's counters; subagent counters live in each subagent's UI context (`ctx.ui` is session-scoped).
+- **Status widget split.** `[Harvester] Turn: N | Streak: M` renders in whichever session currently owns the UI. Subagent sessions show their own widget; the parent won't see subagent streaks unless bridged via `pi.events` (`subagents:created/started/completed/failed/steered/compacted`).
+- **Shared sink, concurrent writers.** `.pi/harvest/trajectories.jsonl` is filesystem-shared. Parent + N subagents all append to the same JSONL. Append-only design tolerates it; the DPO pipeline downstream must accept multi-session provenance per file. A `sessionId` field on each record is deferred to Phase 5.
+- **`isolated: true` opts out by design.** Any subagent marked `isolated: true` in its agent config gets `extensions: false` per pi-subagents' isolation semantics — pi-harvest is silently skipped there. This matches pi-subagents' intent and is not a bug.
+- **Default load.** All built-in pi-subagents agents (`general-purpose`, `Explore`, `Plan`, `statusline-setup`) declare `extensions: true` — meaning all parent-session extensions (including pi-harvest) load into the subagent by default. No opt-in needed for the common case.
+- **`/harvest` command availability.** The slash command registers per-session. It works inside any subagent session that has pi-harvest loaded; the resulting audit + splice operate on that subagent's own chat context.
+
+If subagent-aware aggregation is ever needed (parent UI shows aggregate streak across all children), it lives in Phase 7+ and goes through `pi.events` — never by sharing module-local state across sessions.
+
 ---
 
 ## 7. Phased roadmap
