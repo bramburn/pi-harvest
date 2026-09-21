@@ -1,6 +1,6 @@
 {
   "name": "pi-harvest",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Trajectory harvester extension for pi.dev — monitors local worker model runs and intercepts compilation failure loops.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -11,7 +11,9 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "test": "npm run build && node --test tests/verifier.test.js tests/slice.test.js tests/sink.test.js",
+    "smoke": "npm run build && node tests/smoke.js",
+    "prepublishOnly": "npm run build && npm test && npm run smoke"
   },
   "keywords": [
     "pi",
