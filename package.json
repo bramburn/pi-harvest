@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts",
+    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts test/splice.test.ts",
     "smoke": "npm run build && node tests/smoke.js",
     "prepublishOnly": "npm run build && npm test && npm run smoke"
   },

@@ -71,6 +71,19 @@ interface PiContext {
  getBranch(): SessionEntry[];
  getSessionId(): string;
  };
+ // Command-handler-only capabilities. Present in ExtensionCommandContext
+ // (slash commands) but NOT in ExtensionContext (event handlers like
+ // turn_end / tool_result). Always use these defensively - check typeof
+ // before invoking, since rewind will silently no-op otherwise.
+ navigateTree?: (
+ targetId: string,
+ options?: {
+ summarize?: boolean;
+ customInstructions?: string;
+ replaceInstructions?: boolean;
+ label?: string;
+ },
+ ) => Promise<{ cancelled: boolean }>;
  [key: string]: unknown;
 }
 
@@ -105,15 +118,11 @@ interface ExtensionAPI {
  options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
  ): void;
 
- navigateTree(
- targetId: string,
- options?: {
- summarize?: boolean;
- customInstructions?: string;
- replaceInstructions?: boolean;
- label?: string;
- },
- ): Promise<{ cancelled: boolean }>;
+ // NOTE: navigateTree, newSession, fork, etc. are NOT on ExtensionAPI.
+ // They live on ExtensionCommandContext (the `ctx` passed to slash-command
+ // handlers) and on withSession() callbacks. Event handlers receive
+ // ExtensionContext which does not include them. See PiContext below for
+ // the optional ctx-level capabilities.
 
  registerCommand(
  name: string,
@@ -319,7 +328,14 @@ export default function (pi: ExtensionAPI): void {
  "info",
  );
 
- await performSplice(audit, slice, pi as never, ctx as never);
+ // SpliceHost: sendUserMessage comes from the extension API (always
+ // available). navigateTree comes from the command context if present
+ // (the event-handler ctx doesn't expose it; the rewind is silently
+ // skipped in that case).
+ await performSplice(audit, slice, {
+ sendUserMessage: pi.sendUserMessage.bind(pi),
+ navigateTree: typeof ctx.navigateTree === "function" ? ctx.navigateTree.bind(ctx) : undefined,
+ }, ctx);
  } catch (err) {
  const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
  const cause = recordFailure(ctx, "audit", err);
@@ -373,7 +389,7 @@ export default function (pi: ExtensionAPI): void {
  slice: lastSlice,
  chosenCompletion: chosen,
  rejectedCompletion: lastRejected,
- ctx: ctx as never,
+ ctx,
  domainTags,
  workerModel: workerModelId(ctx),
  verifierModel: process.env.VERIFIER_MODEL ?? "unknown",
@@ -845,9 +861,9 @@ export default function (pi: ExtensionAPI): void {
  // can be found), we still inject the steering message - the spec's
  // explicit contract is that the steering message lands.
  const targetId = entryIdBeforeMostRecentAssistant(slice);
- if (targetId) {
+ if (targetId && typeof c.navigateTree === "function") {
  try {
- const nav = await (pi as ExtensionAPI).navigateTree(targetId, {
+ const nav = await c.navigateTree(targetId, {
  summarize: true,
  customInstructions: review.steering_instructions,
  });
@@ -858,6 +874,8 @@ export default function (pi: ExtensionAPI): void {
  const msg = (err as Error)?.message ?? String(err);
  notify(c, "Review navigateTree failed: " + msg, "warn");
  }
+ } else if (targetId && typeof c.navigateTree !== "function") {
+ notify(c, "Review: rewind unavailable in this context; proceeding with steer-only splice", "info");
  }
 
  const steeringBody =
@@ -866,7 +884,7 @@ export default function (pi: ExtensionAPI): void {
  "Diagnosis: " + review.diagnosis + "\n" +
  "Action Required: " + review.steering_instructions;
  try {
- (pi as ExtensionAPI).sendUserMessage(steeringBody, { deliverAs: "steer" });
+ pi.sendUserMessage(steeringBody, { deliverAs: "steer" });
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
  notify(c, "Review sendUserMessage failed: " + msg, "warn");
@@ -980,7 +998,7 @@ export default function (pi: ExtensionAPI): void {
  "Analysis: " + opinion.opinion_summary + "\n" +
  "Action Required: " + opinion.refactor_instructions;
  try {
- (pi as ExtensionAPI).sendUserMessage(steeringBody, { deliverAs: "steer" });
+ pi.sendUserMessage(steeringBody, { deliverAs: "steer" });
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
  notify(c, "Opinion sendUserMessage failed: " + msg, "warn");
@@ -1036,7 +1054,7 @@ export default function (pi: ExtensionAPI): void {
  slice,
  chosenCompletion: distilled.distilled_chosen_completion,
  rejectedCompletion: rejectedText,
- ctx: c as never,
+ ctx: c,
  domainTags: inferDomainTags(slice.modifiedPaths),
  workerModel: workerModelId(c),
  verifierModel: process.env.VERIFIER_MODEL ?? "unknown",

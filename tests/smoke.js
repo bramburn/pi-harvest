@@ -50,9 +50,11 @@ function makePi() {
  sendUserMessage(content, options) {
  calls.sendUserMessage.push({ content: content, options: options });
  },
- async navigateTree(targetId, options) {
- calls.navigateTree.push({ targetId: targetId, options: options });
- return { cancelled: false };
+ // Note: in real pi, navigateTree lives on ExtensionCommandContext (the
+ // ctx passed to slash-command handlers), NOT on ExtensionAPI (the pi
+ // object). The smoke ctx mock must expose it on ctx.
+ _navigateTree(targetId, options) {
+ return calls.navigateTree;
  },
  _fire(event, eventObj, ctx) {
  if (handlers[event]) {
@@ -157,6 +159,13 @@ async function main() {
  return "sess-smoke-1";
  },
  },
+ // Mirror real pi: navigateTree lives on ExtensionCommandContext (the ctx).
+ // The smoke test exercises the compiler-streak path which fires from
+ // turn_end, where ctx is an ExtensionContext without navigateTree. So
+ // for this path we expect rewind to be skipped; the steer-only splice
+ // still lands via sendUserMessage. Manual /harvest audit would exercise
+ // the command ctx path and would have navigateTree.
+ navigateTree: undefined,
  };
 
  extension(pi);
@@ -186,9 +195,15 @@ async function main() {
  assert.match(steering.content, /Add `;`/);
  assert.equal(steering.options.deliverAs, "steer");
 
- assert.equal(pi.calls.navigateTree.length, 1);
- assert.equal(pi.calls.navigateTree[0].targetId, "t1");
- assert.equal(pi.calls.navigateTree[0].options.summarize, true);
+ // Auto-audit fires from turn_end; ExtensionContext doesn't expose
+ // navigateTree there, so the rewind is silently skipped and only the
+ // steer message lands. The command-ctx path (manual /harvest audit)
+ // exercises navigateTree below.
+ assert.equal(pi.calls.navigateTree.length, 0);
+ const skipNotify = pi.notifyCalls.find(function (m) {
+ return /Rewind skipped/.test(m);
+ });
+ assert.ok(skipNotify, "expected a 'Rewind skipped' notification on the auto-audit path");
 
  branch.push({
  type: "message",
@@ -257,8 +272,17 @@ async function main() {
  // -----------------------------------------------------------------------
  // 4. Phase 3 slash commands: /harvest audit (manual trigger)
  // -----------------------------------------------------------------------
+ // Simulate the command-handler ctx (real pi's ExtensionCommandContext
+ // includes navigateTree; the event-handler ctx does not).
+ const commandCtx = Object.assign({}, ctx, {
+ navigateTree: function (targetId, options) {
+ pi.calls.navigateTree.push({ targetId: targetId, options: options });
+ return { cancelled: false };
+ },
+ });
+
  pi.notifyCalls.length = 0;
- await pi._callCommand("harvest", "audit", ctx);
+ await pi._callCommand("harvest", "audit", commandCtx);
  await waitFor(function () {
  return lastAudited === 2;
  }, { timeoutMs: 4000 });
@@ -266,6 +290,12 @@ async function main() {
  return /Manual audit requested/.test(m);
  });
  assert.ok(auditMsg, "audit command should emit a 'Manual audit requested' notification");
+
+ // Manual audit fires from the slash-command handler, so navigateTree IS
+ // available on the command ctx. Verify the rewind happened.
+ assert.equal(pi.calls.navigateTree.length, 1);
+ assert.equal(pi.calls.navigateTree[0].targetId, "t1");
+ assert.equal(pi.calls.navigateTree[0].options.summarize, true);
 
  // Status after manual audit should show awaiting_resolution state.
  pi.notifyCalls.length = 0;

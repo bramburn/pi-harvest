@@ -1,6 +1,19 @@
 /**
- * Context Surgery: navigateTree (closest real analogue to "prune")
- * + sendUserMessage (the correct way to inject a steering string).
+ * Context Surgery: navigateTree (only available in command-handler
+ * contexts in real pi runtimes) + sendUserMessage (always available on
+ * the extension API).
+ *
+ * NOTE on navigateTree availability: pi's ExtensionAPI (the `pi` object
+ * passed to extensions) does NOT expose navigateTree. The method lives
+ * on ExtensionCommandContextActions, which is only passed to slash
+ * command handlers and to withSession() callbacks. Event handlers
+ * (turn_end, tool_result) receive an ExtensionContext that does not
+ * have it.
+ *
+ * SpliceHost therefore makes navigateTree OPTIONAL. Callers from
+ * command handlers (runReview, runOpinion, /harvest audit) pass a
+ * navigateTree function; callers from event handlers (the auto-audit
+ * trigger in turn_end) pass null and the rewind is silently skipped.
  */
 
 import type { NeatSlice, VerifierAudit } from "./types.js";
@@ -9,6 +22,7 @@ import { entryIdForDivergenceTurn } from "./slice.js";
 export interface SpliceResult {
  navigated: boolean;
  navigatedToEntryId: string | null;
+ navigationSkippedReason: "no-navigateTree" | "no-divergence" | "no-target" | "cancelled" | null;
  steeringInjected: boolean;
 }
 
@@ -20,6 +34,9 @@ export interface SpliceContext {
  notify?: (message: string, level?: string) => void;
  setStatus?: (key: string, content: unknown) => void;
  };
+ // Permit extra fields (cwd, model, navigateTree, ...) so callers can
+ // pass a real ExtensionContext / ExtensionCommandContext without casts.
+ [key: string]: unknown;
 }
 
 export interface SpliceHost {
@@ -27,7 +44,11 @@ export interface SpliceHost {
  content: string,
  options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
  ): void;
- navigateTree(
+ /**
+ * Optional navigateTree. Pass null when called from an event handler
+ * (ExtensionContext does not include this method).
+ */
+ navigateTree?: (
  targetId: string,
  options?: {
  summarize?: boolean;
@@ -35,7 +56,7 @@ export interface SpliceHost {
  replaceInstructions?: boolean;
  label?: string;
  },
- ): Promise<{ cancelled: boolean }>;
+ ) => Promise<{ cancelled: boolean }>;
 }
 
 /**
@@ -85,41 +106,57 @@ function resolveDivergenceEntryId(audit: VerifierAudit, slice: NeatSlice): strin
 export async function performSplice(
  audit: VerifierAudit,
  slice: NeatSlice,
- pi: SpliceHost,
- _ctx: SpliceContext,
+ host: SpliceHost,
+ ctx: SpliceContext,
 ): Promise<SpliceResult> {
  const result: SpliceResult = {
  navigated: false,
  navigatedToEntryId: null,
+ navigationSkippedReason: null,
  steeringInjected: false,
  };
 
- if (audit.divergence_detected) {
+ if (!audit.divergence_detected) {
+ result.navigationSkippedReason = "no-divergence";
+ } else {
  const targetId = resolveDivergenceEntryId(audit, slice);
- if (targetId) {
+ if (!targetId) {
+ result.navigationSkippedReason = "no-target";
+ } else if (!host.navigateTree) {
+ // Event handlers (turn_end, tool_result) don't expose navigateTree on
+ // the ExtensionContext. Skip the rewind gracefully — the steering
+ // message will still land via sendUserMessage below.
+ result.navigationSkippedReason = "no-navigateTree";
+ ctx.ui?.notify?.(
+ "[Harvester] Rewind skipped: navigateTree only available in command-handler contexts; proceeding with steer-only splice.",
+ "info",
+ );
+ } else {
  try {
- const nav = await pi.navigateTree(targetId, {
+ const nav = await host.navigateTree(targetId, {
  summarize: true,
  customInstructions: audit.steering_instructions,
  });
- if (!nav.cancelled) {
+ if (nav.cancelled) {
+ result.navigationSkippedReason = "cancelled";
+ } else {
  result.navigated = true;
  result.navigatedToEntryId = targetId;
  }
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
- _ctx.ui?.notify?.("[Harvester] navigateTree failed: " + msg, "warn");
+ ctx.ui?.notify?.("[Harvester] navigateTree failed: " + msg, "warn");
  }
  }
  }
 
  try {
  const body = buildSteeringBody(audit);
- pi.sendUserMessage(body, { deliverAs: "steer" });
+ host.sendUserMessage(body, { deliverAs: "steer" });
  result.steeringInjected = true;
  } catch (err) {
  const msg = (err as Error)?.message ?? String(err);
- _ctx.ui?.notify?.("[Harvester] sendUserMessage failed: " + msg, "warn");
+ ctx.ui?.notify?.("[Harvester] sendUserMessage failed: " + msg, "warn");
  }
 
  return result;

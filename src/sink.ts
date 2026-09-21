@@ -33,6 +33,10 @@ import type {
 export interface SinkContext {
  cwd: string;
  sessionManager?: { getSessionId(): string };
+ // Permit extra fields (ui, model, navigateTree, ...) so callers can
+ // pass a real ExtensionContext / ExtensionCommandContext / PiContext
+ // without casts.
+ [key: string]: unknown;
 }
 
 export interface SinkResult {
