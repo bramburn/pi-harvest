@@ -1,35 +1,35 @@
 /**
- * pi-harvest — Phase 1 + Phase 2 + Phase 3.
+ * pi-harvest — Phase 1 + Phase 2 + Phase 3 + Phase 4.
  *
- * Phase 1:
- * - tool_result hook: case-insensitive compiler-failure scan; tracks a
- * streak count.
- * - turn_end hook: periodic and emergency triggers.
- * - TUI status widget.
+ * Phase 1: telemetry hooks, TUI status widget, streak detection.
+ * Phase 2: Neat Slice, verifier call, navigateTree+sendUserMessage splice,
+ *          DPO sink write.
+ * Phase 3: workspace capture, domain taxonomy, token clamps, verifier
+ *          retries with backoff, full HarvestedTrajectoryRecord schema,
+ *          /harvest status + /harvest audit slash commands.
+ * Phase 4: monthly log rotation, git diff capture, native HF DPO
+ *          exporter, telemetry aggregation (Top-N flaw categories).
  *
- * Phase 2:
- * - extractNeatSlice(): backward walk to the Inception Prompt.
- * - invokeVerifier(): OpenAI-compatible POST with strict JSON schema.
- * - performSplice(): navigateTree (rewind) + sendUserMessage (steering).
- * - writeDpoEntry(): append DPO record to .pi/harvest/trajectories.jsonl.
+ * State machine (formalised):
+ *   idle  --(threshold trips)-->  auditing
+ *   auditing --(success)-->  awaiting_resolution
+ *   auditing --(network failure / exception)-->  idle  (streak reset to 0)
+ *   awaiting_resolution --(streak drops to 0)-->  idle  (DPO written)
  *
- * Phase 3 additions:
- * - captureActiveFileStates(): workspace capture with 300-line / 12KB clamp.
- * - inferDomainTags(): local fallback for the new domain_tags schema field.
- * - invokeVerifier() retries with exponential backoff (1s -> 2s) on 429/5xx.
- * - VerifierUnavailableError resets compilerFailStreak on exhaustion so we
- * never block the user's interactive session on a flaky endpoint.
- * - /harvest status and /harvest audit slash commands.
- * - Expanded TUI widget with explicit State indicator.
- * - Full HarvestedTrajectoryRecord schema (active_files, compiler_error_summary,
- * worker_model, verifier_model, trigger_reason, nested k3_audit).
+ * The state guard in turn_end (`if (state === "idle")`) prevents the
+ * loop from re-triggering while a previous audit is still in flight
+ * or waiting for resolution. Network failures fall through the catch
+ * + finally blocks of runAudit() and reset state to idle so the user
+ * is never permanently blocked by a flaky verifier endpoint.
  */
 
-import { writeDpoEntry, getSinkStats, countHarvestedRecords } from "./sink.js";
+import { writeDpoEntry, getSinkStats, currentSinkPath } from "./sink.js";
 import { extractNeatSlice, messageToText } from "./slice.js";
 import { invokeVerifier } from "./verifier.js";
 import { performSplice } from "./splice.js";
-import { captureActiveFileStates, inferDomainTags } from "./workspace.js";
+import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
+import { exportToHuggingFaceDPO } from "./exporter.js";
+import { aggregateTelemetry, formatTelemetryForNotify } from "./telemetry.js";
 import type {
  ActiveFile,
  NeatSlice,
@@ -123,12 +123,14 @@ export default function (pi: ExtensionAPI): void {
  let harvestCount = 0;
  let state: HarvesterState = "idle";
  let lastTriggerReason: TriggerReason = "compiler_streak";
+ let lastAuditedTurn = 0; // turn counter at the most recent audit trigger
 
  let lastAudit: VerifierAudit | null = null;
  let lastSlice: NeatSlice | null = null;
  let lastActiveFiles: ActiveFile[] = [];
  let lastRejected: string = "";
  let lastDivergenceEntryId: string | null = null;
+ let lastGitDiffSummary: string | null = null;
  let auditInFlight: Promise<void> | null = null;
 
  // -------------------------------------------------------------------------
@@ -144,7 +146,8 @@ export default function (pi: ExtensionAPI): void {
  " | Harvests: " +
  harvestCount +
  " | State: " +
- state
+ state +
+ (lastAuditedTurn > 0 ? " | LastAudit: " + lastAuditedTurn : "")
  );
  }
 
@@ -183,6 +186,7 @@ export default function (pi: ExtensionAPI): void {
  auditInFlight = (async () => {
  state = "auditing";
  lastTriggerReason = triggerReason;
+ lastAuditedTurn = turnCounter;
  paint(ctx);
 
  try {
@@ -190,12 +194,18 @@ export default function (pi: ExtensionAPI): void {
  const slice = extractNeatSlice(branch, ctx.cwd);
  const audit = await invokeVerifier(slice);
 
- // Capture active files at audit time.
+ // Capture active files + git diff at audit time.
  let activeFiles: ActiveFile[] = [];
+ let gitDiff: string | null = null;
  try {
  activeFiles = await captureActiveFileStates(ctx.cwd, slice.modifiedPaths);
  } catch {
  activeFiles = [];
+ }
+ try {
+ gitDiff = extractGitDiff(ctx.cwd);
+ } catch {
+ gitDiff = null;
  }
 
  lastAudit = audit;
@@ -204,6 +214,7 @@ export default function (pi: ExtensionAPI): void {
  lastRejected = slice.failedCode || extractLatestAssistant(branch);
  lastDivergenceEntryId =
  typeof audit.divergence_turn_entry_id === "string" ? audit.divergence_turn_entry_id : null;
+ lastGitDiffSummary = gitDiff;
  state = "awaiting_resolution";
 
  notify(
@@ -222,21 +233,27 @@ export default function (pi: ExtensionAPI): void {
  } catch (err) {
  const isUnavailable = (err as { name?: string })?.name === "VerifierUnavailableError";
  if (isUnavailable) {
- notify(ctx, "Verifier endpoint unavailable. Continuing unsteered.", "warning");
+ notify(ctx, "Audit failed, unlocking state. Continuing unsteered.", "warning");
  // Reset the streak so we don't loop forever on a flaky endpoint.
  compilerFailStreak = 0;
  } else {
  const msg = (err as Error)?.message ?? String(err);
- notify(ctx, "Audit failed: " + msg, "warn");
+ notify(ctx, "Audit failed: " + msg + " (unlocking state)", "warn");
  }
+ // The finally block below handles state + auditInFlight cleanup.
+ } finally {
+ auditInFlight = null;
+ // Only set awaiting_resolution if the audit succeeded — otherwise
+ // drop back to idle so the loop continues.
+ if (state === "auditing") {
  state = "idle";
  lastAudit = null;
  lastSlice = null;
  lastActiveFiles = [];
  lastRejected = "";
  lastDivergenceEntryId = null;
- } finally {
- auditInFlight = null;
+ lastGitDiffSummary = null;
+ }
  paint(ctx);
  }
  })();
@@ -245,7 +262,7 @@ export default function (pi: ExtensionAPI): void {
  /**
  * If a previous audit is awaiting resolution AND the streak just
  * dropped back to 0, the worker has fixed the issue — write a DPO
- * record and clear the awaiting flag.
+ * record and reset state to idle.
  */
  function maybeResolveAndHarvest(ctx: PiContext): boolean {
  if (state !== "awaiting_resolution") return false;
@@ -273,6 +290,7 @@ export default function (pi: ExtensionAPI): void {
  triggerReason: lastTriggerReason,
  divergenceEntryId: lastDivergenceEntryId,
  activeFiles: lastActiveFiles,
+ gitDiffSummary: lastGitDiffSummary,
  });
  harvestCount += 1;
  notify(ctx, "Harvested DPO pair → " + result.path + " (" + result.bytes + " bytes)", "info");
@@ -281,26 +299,32 @@ export default function (pi: ExtensionAPI): void {
  notify(ctx, "DPO sink write failed: " + msg, "warn");
  }
 
+ // CRITICAL: reset to idle and clear all cached audit state. Failing to
+ // do this leaves the extension permanently stuck in awaiting_resolution
+ // and blocks every future trigger.
  state = "idle";
  lastAudit = null;
  lastSlice = null;
  lastActiveFiles = [];
  lastRejected = "";
  lastDivergenceEntryId = null;
+ lastGitDiffSummary = null;
+ lastAuditedTurn = turnCounter;
  paint(ctx);
  return true;
  }
 
  // -------------------------------------------------------------------------
- // Slash command: /harvest status | /harvest audit
+ // Slash command: /harvest status | /harvest audit | /harvest export dpo
  // -------------------------------------------------------------------------
 
  pi.registerCommand("harvest", {
- description: "pi-harvest controls: status shows telemetry + sink stats; audit forces a manual harvest",
+ description: "pi-harvest controls. Subcommands: status, audit, export dpo",
  handler: async (args, ctx) => {
- const trimmed = (args ?? "").trim().toLowerCase();
+ const trimmed = ((args ?? "").trim().toLowerCase());
  const c = ctx as PiContext;
 
+ // Subcommand routing.
  if (trimmed === "audit") {
  if (auditInFlight) {
  notify(c, "Audit already in flight", "warn");
@@ -311,8 +335,24 @@ export default function (pi: ExtensionAPI): void {
  return;
  }
 
+ if (trimmed === "export" || trimmed.startsWith("export ")) {
+ try {
+ const result = await exportToHuggingFaceDPO({ cwd: c.cwd });
+ notify(
+ c,
+ "DPO export written: " + result.path + " (" + result.count + " records, " + result.bytes + " bytes)",
+ "info",
+ );
+ } catch (err) {
+ const msg = (err as Error)?.message ?? String(err);
+ notify(c, "DPO export failed: " + msg, "warn");
+ }
+ return;
+ }
+
  // Default + "status": print a summary.
- const stats = getSinkStats(c.cwd);
+ const stats = await getSinkStats(c.cwd);
+ const telemetry = await aggregateTelemetry(c.cwd, 3);
  const line1 =
  "Status: turn=" +
  turnCounter +
@@ -321,7 +361,8 @@ export default function (pi: ExtensionAPI): void {
  " harvests=" +
  harvestCount +
  " state=" +
- state;
+ state +
+ (lastAuditedTurn > 0 ? " lastAudit=" + lastAuditedTurn : "");
  const line2 =
  "Verifier: " +
  (process.env.VERIFIER_BASE_URL || "<unset>") +
@@ -336,8 +377,8 @@ export default function (pi: ExtensionAPI): void {
  stats.sizeBytes +
  "B";
  const line4 = "Worker: " + workerModelId(c);
- // Emit as a single multi-line notify.
- c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4, "info");
+ const line5 = formatTelemetryForNotify(telemetry);
+ c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n" + line5, "info");
  paint(c);
  },
  });
@@ -373,9 +414,14 @@ export default function (pi: ExtensionAPI): void {
  const c = ctx as PiContext;
  turnCounter += 1;
 
+ // 1) If a previous audit is awaiting resolution AND the worker just
+ // produced clean bash output, write the DPO record.
  if (maybeResolveAndHarvest(c)) {
  // already painted inside
  } else if (state === "idle") {
+ // 2) Otherwise, evaluate trigger thresholds. The `state === "idle"`
+ // guard prevents re-firing while an audit is in flight or waiting
+ // for resolution — that's the deadlock guard.
  const turnHit = TURN_INTERVAL > 0 && turnCounter % TURN_INTERVAL === 0;
  const streakHit = STREAK_THRESHOLD > 0 && compilerFailStreak >= STREAK_THRESHOLD;
  if (turnHit || streakHit) {
@@ -391,7 +437,9 @@ export default function (pi: ExtensionAPI): void {
  });
 }
 
-// Re-export so consumers/tests can grab the error class.
+// Re-exports for tests / external introspection.
 export { VerifierUnavailableError } from "./types.js";
-// countHarvestedRecords is useful for tests / external introspection.
-export { countHarvestedRecords } from "./sink.js";
+export { exportToHuggingFaceDPO, mapRecordToHfDpo } from "./exporter.js";
+export { aggregateTelemetry, formatTelemetryForNotify } from "./telemetry.js";
+export { extractGitDiff } from "./workspace.js";
+export { currentSinkPath, listSinkFiles } from "./sink.js";

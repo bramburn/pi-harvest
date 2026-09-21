@@ -12,6 +12,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { isAbsolute, relative, sep, normalize } from "node:path";
 
 import type { ActiveFile, SessionEntry, AgentMessage, AgentMessagePart } from "./types.js";
@@ -276,4 +277,49 @@ export function inferDomainTags(paths: string[]): string[] {
  }
  }
  return Array.from(tags);
+}
+
+/**
+ * Maximum lines captured from `git diff --unified=3`.
+ */
+export const MAX_GIT_DIFF_LINES = 200;
+
+/**
+ * Git diff capture timeout (ms). Keeps a missing/hung git from
+ * stalling the audit.
+ */
+export const GIT_DIFF_TIMEOUT_MS = 5000;
+
+/**
+ * Safely capture the local uncommitted `git diff` for the workspace.
+ *
+ * Returns `null` (not throws) when:
+ * - git is not installed (ENOENT)
+ * - cwd is not inside a git repository (non-zero exit)
+ * - the command times out
+ * - any other unexpected error
+ *
+ * Output is clamped to MAX_GIT_DIFF_LINES to prevent verifier-payload
+ * ballooning.
+ */
+export function extractGitDiff(cwd: string, maxLines: number = MAX_GIT_DIFF_LINES): string | null {
+ if (!cwd) return null;
+ try {
+ const raw = execFileSync("git", ["diff", "--unified=3"], {
+ cwd,
+ encoding: "utf8",
+ timeout: GIT_DIFF_TIMEOUT_MS,
+ windowsHide: true,
+ stdio: ["ignore", "pipe", "pipe"],
+ maxBuffer: 4 * 1024 * 1024,
+ });
+ if (typeof raw !== "string" || raw.trim().length === 0) return null;
+ const lines = raw.split(/\r?\n/);
+ if (lines.length <= maxLines) return raw;
+ return lines.slice(0, maxLines).join("\n") + "\n[... git diff clamped for harvest ...]";
+ } catch {
+ // Swallow every error path: ENOENT (no git), non-zero exit (not a repo),
+ // ETIMEDOUT (hung git), EACCES (permissions), etc.
+ return null;
+ }
 }

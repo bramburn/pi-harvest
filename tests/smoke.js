@@ -84,7 +84,10 @@ async function waitFor(predicate, opts) {
 
 async function main() {
  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harvest-smoke-"));
- const jsonlPath = path.join(cwd, ".pi", "harvest", "trajectories.jsonl");
+ const d = new Date();
+ const y = d.getUTCFullYear();
+ const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+ const jsonlPath = path.join(cwd, ".pi", "harvest", "trajectories_" + y + "_" + m + ".jsonl");
 
  let lastAudited = 0;
  const mock = await startMockVerifier(function (_req, res) {
@@ -224,6 +227,8 @@ async function main() {
  assert.equal(entry.k3_audit.root_cause, "missing semicolon");
  assert.equal(entry.k3_audit.steering_instructions, "Add `;` at end of statement.");
  assert.ok(Array.isArray(entry.active_files));
+ // Phase 4 schema field
+ assert.ok("git_diff_summary" in entry, "git_diff_summary must be present (null is OK)");
 
  // -----------------------------------------------------------------------
  // 3. Phase 3 slash commands: /harvest status
@@ -244,6 +249,10 @@ async function main() {
  assert.match(statusMsg, /model=test-model/);
  assert.match(statusMsg, /records=1/);
  assert.match(statusMsg, /size=\d+B/);
+ // Phase 4 telemetry aggregation
+ assert.match(statusMsg, /Harvest Telemetry/);
+ assert.match(statusMsg, /Top Flaws/);
+ assert.match(statusMsg, /logic_error \(1\)/);
 
  // -----------------------------------------------------------------------
  // 4. Phase 3 slash commands: /harvest audit (manual trigger)
@@ -267,7 +276,59 @@ async function main() {
  assert.ok(afterMsg);
  assert.match(afterMsg, /state=awaiting_resolution/);
 
- console.log("Phase 2 + Phase 3 smoke test PASSED");
+ // -----------------------------------------------------------------------
+ // 5. Phase 4: /harvest export dpo
+ // -----------------------------------------------------------------------
+ // First resolve the manual audit by giving the worker a clean compile.
+ branch.push({
+ type: "message",
+ id: "a3",
+ parentId: "a2",
+ timestamp: "2026-01-01T00:00:04.000Z",
+ message: { role: "assistant", content: "fn main() { println!('manual hello'); }" },
+ });
+ pi._fire("tool_result", { toolName: "bash", output: "Build succeeded." }, ctx);
+ pi._fire("turn_end", {}, ctx);
+
+ await waitFor(function () {
+ return fs.existsSync(jsonlPath) && fs.readFileSync(jsonlPath, "utf8").trim().split("\n").length >= 2;
+ }, { timeoutMs: 4000 });
+
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest", "export dpo", ctx);
+ const exportMsg = pi.notifyCalls.find(function (m) {
+ return /DPO export written/.test(m);
+ });
+ assert.ok(exportMsg, "export command should emit a 'DPO export written' notification");
+ const exportMatch = exportMsg.match(/DPO export written: ([^\s]+)/);
+ assert.ok(exportMatch, "export message should contain the file path");
+ const exportPath = exportMatch[1];
+ assert.ok(fs.existsSync(exportPath), "export file must exist on disk: " + exportPath);
+
+ // Validate HF DPO format on the export
+ const exportLines = fs.readFileSync(exportPath, "utf8").trim().split("\n");
+ assert.equal(exportLines.length, 2);
+ for (const line of exportLines) {
+ const rec = JSON.parse(line);
+ assert.equal(rec.prompt.length, 1);
+ assert.equal(rec.prompt[0].role, "user");
+ assert.equal(rec.chosen.length, 1);
+ assert.equal(rec.chosen[0].role, "assistant");
+ assert.equal(rec.rejected.length, 1);
+ assert.equal(rec.rejected[0].role, "assistant");
+ assert.match(rec.prompt[0].content, /=== TASK ===/);
+ assert.match(rec.prompt[0].content, /=== GIT DIFF ===/);
+ // ACTIVE FILES section is only present when the slice had modifiedPaths;
+ // the smoke mock doesn't trigger write/edit tool calls, so this is optional.
+ // The exporter correctly omits empty sections.
+ }
+
+ // -----------------------------------------------------------------------
+ // 6. Phase 4: log rotation — the sink filename should be date-stamped
+ // -----------------------------------------------------------------------
+ assert.match(jsonlPath, /trajectories_\d{4}_\d{2}\.jsonl$/);
+
+ console.log("Phase 2 + Phase 3 + Phase 4 smoke test PASSED");
  console.log(" DPO entry written: " + jsonlPath);
  console.log(" session_id: " + entry.session_id);
  console.log(" worker_model: " + entry.worker_model);

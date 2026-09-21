@@ -124,6 +124,7 @@ export interface HarvestedTrajectoryRecord {
  immediate_prompt: string;
  active_files: ActiveFile[];
  compiler_error_summary: string;
+ git_diff_summary: string | null;
  k3_audit: {
  divergence_entry_id: string | null;
  flaw_category: string;
