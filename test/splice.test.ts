@@ -169,3 +169,37 @@ test("performSplice: files line omitted when slice has no modified paths", async
  });
  assert.doesNotMatch(sent[0], /Files:/);
 });
+
+test("steerPrefix: defaults to K3, honors VERIFIER_PROVIDER, carries sub-labels", async () => {
+ const { steerPrefix } = await import("../dist/splice.js");
+ delete process.env.VERIFIER_PROVIDER;
+ assert.equal(steerPrefix(), "[STEER:K3]");
+ assert.equal(steerPrefix("SEMANTIC REVIEW"), "[STEER:K3][SEMANTIC REVIEW]");
+ process.env.VERIFIER_PROVIDER = "deepseek";
+ try {
+ assert.equal(steerPrefix(), "[STEER:DEEPSEEK]");
+ assert.equal(steerPrefix("THRASHING"), "[STEER:DEEPSEEK][THRASHING]");
+ // Values are sanitized to a single greppable token.
+ process.env.VERIFIER_PROVIDER = "k3 beta!";
+ assert.equal(steerPrefix(), "[STEER:K3BETA]");
+ } finally {
+ delete process.env.VERIFIER_PROVIDER;
+ }
+});
+
+test("performSplice: steering body renders provider tag and sub-label", async () => {
+ process.env.VERIFIER_PROVIDER = "deepseek";
+ try {
+ const { host, sent } = hostWith();
+ await performSplice(
+ BASE_AUDIT,
+ BASE_SLICE,
+ host,
+ { sessionManager: { getSessionId: () => "s" } },
+ { failedCommand: "cargo build", subLabel: "SEMANTIC REVIEW" },
+ );
+ assert.match(sent[0], /^\[STEER:DEEPSEEK\]\[SEMANTIC REVIEW\]\n/);
+ } finally {
+ delete process.env.VERIFIER_PROVIDER;
+ }
+});

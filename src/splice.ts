@@ -28,6 +28,31 @@ import { entryIdForDivergenceTurn, enforcePayloadSize } from "./slice.js";
 export interface SteeringContext {
  /** Bash command line that last produced a compiler failure, if known. */
  failedCommand?: string;
+ /** Optional alert-type sub-label, e.g. "SEMANTIC REVIEW". */
+ subLabel?: string;
+}
+
+/**
+ * Resolve the Tier-3 steer provider tag from the environment.
+ * VERIFIER_PROVIDER selects the commander (default k3, "deepseek" is
+ * the documented fallback); the value is uppercased and sanitized so
+ * the tag stays a single greppable token.
+ */
+export function steerProviderTag(): string {
+ const raw = (process.env.VERIFIER_PROVIDER ?? "k3").trim().toUpperCase();
+ const sanitized = raw.replace(/[^A-Z0-9_-]/g, "");
+ return sanitized.length > 0 ? sanitized : "K3";
+}
+
+/**
+ * The canonical Tier-3 prefix for every synthetic steering message:
+ * [STEER:<PROVIDER>] with an optional [TYPE] sub-label, e.g.
+ * [STEER:K3][SEMANTIC REVIEW]. Downstream slicers classify any message
+ * starting with "[STEER:" as Tier 3 (supervisor), never a user prompt.
+ */
+export function steerPrefix(subLabel?: string): string {
+ const sub = subLabel?.trim();
+ return "[STEER:" + steerProviderTag() + "]" + (sub ? "[" + sub + "]" : "");
 }
 
 /**
@@ -82,8 +107,10 @@ export interface SpliceHost {
 }
 
 /**
- * Build the steering message body. Keeps the spec's exact format so the
- * worker can grep for `[STEER:K3]` in its own output.
+ * Build the steering message body. The first line is always the
+ * canonical Tier-3 prefix (see steerPrefix) so the worker — and any
+ * downstream slicer — can grep for `[STEER:` to recognize a supervisor
+ * intervention.
  *
  * Enriched beyond the bare audit fields (steering-quality hardening):
  * - Error: the clamped compiler stderr, so the worker connects the fix
@@ -100,7 +127,7 @@ export interface SpliceHost {
  */
 export function buildSteeringBody(audit: VerifierAudit, slice: NeatSlice, steerCtx?: SteeringContext): string {
  const lines: string[] = [];
- lines.push("[STEER:K3]");
+ lines.push(steerPrefix(steerCtx?.subLabel));
  lines.push("Subtask: " + audit.inferred_subtask);
  if (audit.divergence_detected) {
  lines.push("Flaw: " + audit.flaw_category + " — " + audit.root_cause);

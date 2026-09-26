@@ -396,7 +396,7 @@ async function main() {
  const distSteer = pi.calls.sendUserMessage.find(function (m) {
  return /Optimal path/.test(m.content);
  });
- assert.match(distSteer.content, /\[STEER:K3\]/);
+ assert.match(distSteer.content, /^\[STEER:K3\]\[THRASHING\]/);
  assert.match(distSteer.content, /distilled hello/);
  assert.match(distSteer.content, /thrashing/i);
  assert.equal(distSteer.options.deliverAs, "steer");

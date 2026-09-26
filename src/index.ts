@@ -14,11 +14,11 @@
  * single-turn optimal response and writes it as a DPO pair.
  * Phase 6: Semantic Quality Audits. /harvest review <feedback> slash
  * command that pauses, audits with the Staff Engineer prompt mode,
- * navigates back, and injects [SEMANTIC REVIEW ALERTS].
+ * navigates back, and injects [STEER:<provider>][SEMANTIC REVIEW].
  * Phase 7: Zero-Shot Success Mining. Passive capture of flawless
  * Phase 8: Proactive Architectural Opinions. /harvest opinion [query] slash
  * command that fetches a Principal Software Architect review of WORKING
- * code and injects a forward-looking [ARCHITECTURAL OPINION] advisory steer
+ * code and injects a forward-looking [STEER:<provider>][ARCHITECTURAL OPINION] advisory steer
  * WITHOUT navigatingTree — the pre-refactor working code becomes the
  * rejected_completion, the post-refactor code becomes the chosen_completion.
  * 1-2 turn trajectories into sft_golden_YYYY_MM.jsonl, exportable
@@ -57,7 +57,7 @@
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
 import { extractNeatSlice, messageToText, extractToolResultText, enforcePayloadSize } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
-import { performSplice, buildFilesLine } from "./splice.js";
+import { performSplice, buildFilesLine, steerPrefix } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
 import { exportToHuggingFaceDPO, exportToHuggingFaceSFT } from "./exporter.js";
 import { aggregateTelemetry, formatTelemetryForNotify } from "./telemetry.js";
@@ -966,7 +966,7 @@ export default function (pi: ExtensionAPI): void {
  // Phase 6: Semantic review run. Triggered by /harvest review <feedback>.
  // Calls invokeReviewer with the current slice + active files + the human
  // feedback string. On success: navigateTree to the entry just before the
- // flawed code was generated, then sendUserMessage a [SEMANTIC REVIEW ALERTS]
+ // flawed code was generated, then sendUserMessage a [STEER:<provider>][SEMANTIC REVIEW]
  // block, and transition state to awaiting_resolution so the existing
  // maybeResolveAndHarvest() path picks up the resolution.
  // =========================================================================-
@@ -1044,7 +1044,7 @@ export default function (pi: ExtensionAPI): void {
  }
 
  const steeringBody =
- "[SEMANTIC REVIEW ALERTS]\n" +
+ steerPrefix("SEMANTIC REVIEW") + "\n" +
  "Human Feedback: " + humanFeedback + "\n" +
  "Diagnosis: " + review.diagnosis + "\n" +
  "Action Required: " + review.steering_instructions +
@@ -1164,7 +1164,7 @@ export default function (pi: ExtensionAPI): void {
  // NO navigateTree here — the pre-refactor working code is the rejected
  // baseline. We only inject the forward-looking advisory steer.
  const steeringBody =
- "[ARCHITECTURAL OPINION]\n" +
+ steerPrefix("ARCHITECTURAL OPINION") + "\n" +
  (optionalQuery ? "Query: " + optionalQuery + "\n" : "") +
  "Analysis: " + opinion.opinion_summary + "\n" +
  "Action Required: " + opinion.refactor_instructions +
@@ -1247,7 +1247,7 @@ export default function (pi: ExtensionAPI): void {
  // Inject it as a Tier-3 steer so the worker stops thrashing instead of
  // only feeding the sink. (Budget rule: still exactly one verifier call.)
  const steerBody =
-  "[STEER:K3]\n" +
+  steerPrefix("THRASHING") + "\n" +
   "Subtask: " + (slice.inceptionPrompt || "(current task)") + "\n" +
   "Flaw: thrashing — " + thrashingStreak + " tool calls with repeated rework on the same file(s)\n" +
   "Optimal path (supervisor-distilled single-turn solution):\n" +

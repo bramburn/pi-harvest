@@ -49,7 +49,7 @@ src/
 | `verifier/client.ts` | The single HTTP POST per audit. JSON-schema enforcement. Env-var resolution (`VERIFIER_API_KEY`, `VERIFIER_BASE_URL`, `VERIFIER_MODEL`). | `async function invokeVerifier(slicedContext: SlicedContext): Promise<AuditResult \| null>` |
 | `verifier/prompt.ts` | The audit system prompt + the JSON schema the verifier must obey (includes `inferred_subtask`, `divergence_turn`, `flaw_category`, `root_cause`, `steering_instructions`). | `AUDIT_SYSTEM_PROMPT: string`, `AUDIT_RESPONSE_SCHEMA: object` |
 | `slice/engine.ts` | Backward-traverse `ctx.sessionManager.getEntries()` to find the inception prompt. Read active files via `fs.readFileSync`. | `function sliceContext(entries, activeFilePaths): SlicedContext` |
-| `slice/tiers.ts` | Tag each entry as Tier 1 / Tier 2 / Tier 3. The `[STEER:K3]` prefix is the Tier 3 marker. | `function classifyTier(entry): 1 \| 2 \| 3` |
+| `slice/tiers.ts` | Tag each entry as Tier 1 / Tier 2 / Tier 3. The `[STEER:<provider>]` prefix (optionally `[STEER:<provider>][TYPE]`) is the Tier 3 marker. | `function classifyTier(entry): 1 \| 2 \| 3` |
 | `splice/engine.ts` | Call `ctx.sessionManager.prune(divergenceTurn)`, then `pi.sendMessage(steeringSpec, { deliverAs: "steer", triggerTurn: true })`. | `async function performSplice(ctx, auditResult): Promise<void>` |
 | `sink/jsonl.ts` | `fs.mkdirSync(.pi/harvest, { recursive: true })` + `fs.appendFileSync(trajectories.jsonl, JSON.stringify(record) + "\n")`. | `function appendTrajectory(record): void` |
 | `commands/audit.ts` | `pi.registerCommand("k3-audit", ...)` — manually force an audit and inject the steering. | `function registerAuditCommand(pi, ctx): void` |
