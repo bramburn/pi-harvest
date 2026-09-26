@@ -134,3 +134,38 @@ test("performSplice: still lands the steering message when navigateTree throws",
  assert.equal(sent.length, 1);
  assert.match(sent[0], /\[STEER:K3\]/);
 });
+
+test("performSplice: steering body carries compiler error, verify command, and files", async () => {
+ const { host, sent } = hostWith();
+ const result = await performSplice(
+ BASE_AUDIT,
+ BASE_SLICE,
+ host,
+ { sessionManager: { getSessionId: () => "s" } },
+ { failedCommand: "cargo build" },
+ );
+ assert.equal(result.steeringInjected, true);
+ assert.match(sent[0], /Flaw: logic_error — missing semicolon/);
+ assert.match(sent[0], /Error: error/);
+ assert.match(sent[0], /Fix: Add ; at end of statement\./);
+ assert.match(sent[0], /Verify: run `cargo build` and confirm it exits clean\./);
+ assert.match(sent[0], /Files: rewrite src\/main\.rs/);
+ assert.match(sent[0], /Domain: rust/);
+});
+
+test("performSplice: verify line omitted when no failed command is known", async () => {
+ const { host, sent } = hostWith();
+ await performSplice(BASE_AUDIT, BASE_SLICE, host, {
+ sessionManager: { getSessionId: () => "s" },
+ });
+ assert.doesNotMatch(sent[0], /Verify:/);
+});
+
+test("performSplice: files line omitted when slice has no modified paths", async () => {
+ const { host, sent } = hostWith();
+ const emptyPathsSlice: NeatSlice = { ...BASE_SLICE, modifiedPaths: [] };
+ await performSplice(BASE_AUDIT, emptyPathsSlice, host, {
+ sessionManager: { getSessionId: () => "s" },
+ });
+ assert.doesNotMatch(sent[0], /Files:/);
+});

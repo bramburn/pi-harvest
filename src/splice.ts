@@ -17,7 +17,29 @@
  */
 
 import type { NeatSlice, VerifierAudit } from "./types.js";
-import { entryIdForDivergenceTurn } from "./slice.js";
+import { entryIdForDivergenceTurn, enforcePayloadSize } from "./slice.js";
+
+/**
+ * Extra context for the steering body that the verifier response does
+ * not carry: the command that produced the compiler failure (so the
+ * worker knows exactly how to verify its fix) and the slice's compiler
+ * error / modified-paths.
+ */
+export interface SteeringContext {
+ /** Bash command line that last produced a compiler failure, if known. */
+ failedCommand?: string;
+}
+
+/**
+ * Format the "Files:" line for a steering body. Returns null when there
+ * is nothing worth telling the worker to rewrite.
+ */
+export function buildFilesLine(paths: readonly string[]): string | null {
+ if (!paths || paths.length === 0) return null;
+ const MAX = 5;
+ if (paths.length <= MAX) return "Files: rewrite " + paths.join(", ");
+ return "Files: rewrite " + paths.slice(0, MAX).join(", ") + " (+" + (paths.length - MAX) + " more)";
+}
 
 export interface SpliceResult {
  navigated: boolean;
@@ -62,13 +84,30 @@ export interface SpliceHost {
 /**
  * Build the steering message body. Keeps the spec's exact format so the
  * worker can grep for `[STEER:K3]` in its own output.
+ *
+ * Enriched beyond the bare audit fields (steering-quality hardening):
+ * - Error: the clamped compiler stderr, so the worker connects the fix
+ *   to the failure without re-running the build first.
+ * - Verify: the exact command to run to confirm the fix, when the
+ *   failing command line was captured from tool_result events.
+ * - Files: the files the worker has been editing, so it rewrites the
+ *   right ones instead of patching across stale context.
+ * The final body is hard-clamped to 16 KB.
  */
-function buildSteeringBody(audit: VerifierAudit): string {
+/**
+ * Build the steering message body. Exported for unit tests; production
+ * callers go through performSplice().
+ */
+export function buildSteeringBody(audit: VerifierAudit, slice: NeatSlice, steerCtx?: SteeringContext): string {
  const lines: string[] = [];
  lines.push("[STEER:K3]");
  lines.push("Subtask: " + audit.inferred_subtask);
  if (audit.divergence_detected) {
  lines.push("Flaw: " + audit.flaw_category + " — " + audit.root_cause);
+ if (slice.compilerError) {
+ // Indent continuation lines so the error block stays readable.
+ lines.push("Error: " + slice.compilerError.split("\n").join("\n  "));
+ }
  lines.push("Fix: " + audit.steering_instructions);
  if (audit.discard_advice) {
  lines.push("Discard: " + audit.discard_advice);
@@ -77,10 +116,18 @@ function buildSteeringBody(audit: VerifierAudit): string {
  lines.push("Status: no divergence detected by auditor");
  lines.push("Fix: " + audit.steering_instructions);
  }
+ const failedCommand = steerCtx?.failedCommand?.trim();
+ if (failedCommand) {
+ lines.push("Verify: run `" + failedCommand + "` and confirm it exits clean.");
+ }
+ const filesLine = buildFilesLine(slice.modifiedPaths);
+ if (filesLine) {
+ lines.push(filesLine);
+ }
  if (audit.domain_tags && audit.domain_tags.length > 0) {
  lines.push("Domain: " + audit.domain_tags.join(", "));
  }
- return lines.join("\n");
+ return enforcePayloadSize(lines.join("\n"), 16 * 1024);
 }
 
 /**
@@ -108,6 +155,7 @@ export async function performSplice(
  slice: NeatSlice,
  host: SpliceHost,
  ctx: SpliceContext,
+ steerCtx?: SteeringContext,
 ): Promise<SpliceResult> {
  const result: SpliceResult = {
  navigated: false,
@@ -151,7 +199,7 @@ export async function performSplice(
  }
 
  try {
- const body = buildSteeringBody(audit);
+ const body = buildSteeringBody(audit, slice, steerCtx);
  host.sendUserMessage(body, { deliverAs: "steer" });
  result.steeringInjected = true;
  } catch (err) {

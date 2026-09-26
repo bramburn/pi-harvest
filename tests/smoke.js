@@ -277,6 +277,11 @@ async function main() {
  assert.match(steering.content, /\[STEER:K3\]/);
  assert.match(steering.content, /Add `;`/);
  assert.equal(steering.options.deliverAs, "steer");
+ // Steering-body enrichment: the clamped compiler error, the exact
+ // verification command captured from the failing tool_result, and the
+ // "rewrite these files" line all ride along in the steer.
+ assert.match(steering.content, /Error: error\[E0425\]: cannot find value x/);
+ assert.match(steering.content, /Verify: run `cargo build` and confirm it exits clean\./);
 
  // No steer-only fallback notify, no command-dispatch errors.
  assert.equal(pi.calls.commandErrors.length, 0);

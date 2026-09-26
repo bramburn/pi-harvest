@@ -57,7 +57,7 @@
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
 import { extractNeatSlice, messageToText, extractToolResultText, enforcePayloadSize } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
-import { performSplice } from "./splice.js";
+import { performSplice, buildFilesLine } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
 import { exportToHuggingFaceDPO, exportToHuggingFaceSFT } from "./exporter.js";
 import { aggregateTelemetry, formatTelemetryForNotify } from "./telemetry.js";
@@ -236,6 +236,10 @@ export default function (pi: ExtensionAPI): void {
  // Resolution gate: number of clean build/test-shaped commands since
  // the current steer (reset when an audit triggers and when it resolves).
  let cleanBuildStreak = 0;
+ // Command line that last produced a compiler failure — fed into the
+ // steering body as the "Verify:" line so the worker knows exactly how
+ // to confirm its fix. Reset when an audit cycle resolves.
+ let lastFailedCommand = "";
  // Set when an auto-audit (event-handler ctx) queues a rewind that only
  // a command-handler ctx can execute. Consumed by the "/harvest rewind"
  // subcommand, which pi runs with a fresh command context (including
@@ -402,7 +406,7 @@ export default function (pi: ExtensionAPI): void {
  await performSplice(audit, slice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
  navigateTree: ctx.navigateTree.bind(ctx),
- }, ctx);
+ }, ctx, { failedCommand: lastFailedCommand });
  } else if (audit.divergence_detected) {
  pendingAutoRewind = true;
  try {
@@ -416,13 +420,13 @@ export default function (pi: ExtensionAPI): void {
  await performSplice(audit, slice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
  navigateTree: undefined,
- }, ctx);
+ }, ctx, { failedCommand: lastFailedCommand });
  }
  } else {
  await performSplice(audit, slice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
  navigateTree: undefined,
- }, ctx);
+ }, ctx, { failedCommand: lastFailedCommand });
  }
  } catch (err) {
  if (err instanceof VerifierConfigError) {
@@ -491,7 +495,7 @@ export default function (pi: ExtensionAPI): void {
  await performSplice(lastAudit, lastSlice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
  navigateTree: typeof c.navigateTree === "function" ? c.navigateTree.bind(c) : undefined,
- }, c);
+ }, c, { failedCommand: lastFailedCommand });
  }
 
  /**
@@ -570,6 +574,7 @@ export default function (pi: ExtensionAPI): void {
  lastOpinionQuery = null;
  lastError = null; // successful resolution
  cleanBuildStreak = 0; // gate resets for the next audit cycle
+ lastFailedCommand = ""; // next cycle re-captures from fresh failures
  lastAuditedTurn = turnCounter;
  paint(ctx);
  return true;
@@ -1042,7 +1047,8 @@ export default function (pi: ExtensionAPI): void {
  "[SEMANTIC REVIEW ALERTS]\n" +
  "Human Feedback: " + humanFeedback + "\n" +
  "Diagnosis: " + review.diagnosis + "\n" +
- "Action Required: " + review.steering_instructions;
+ "Action Required: " + review.steering_instructions +
+ (buildFilesLine(slice.modifiedPaths) ? "\n" + buildFilesLine(slice.modifiedPaths) : "");
  try {
  pi.sendUserMessage(steeringBody, { deliverAs: "steer" });
  } catch (err) {
@@ -1161,7 +1167,8 @@ export default function (pi: ExtensionAPI): void {
  "[ARCHITECTURAL OPINION]\n" +
  (optionalQuery ? "Query: " + optionalQuery + "\n" : "") +
  "Analysis: " + opinion.opinion_summary + "\n" +
- "Action Required: " + opinion.refactor_instructions;
+ "Action Required: " + opinion.refactor_instructions +
+ (buildFilesLine(slice.modifiedPaths) ? "\n" + buildFilesLine(slice.modifiedPaths) : "");
  try {
  pi.sendUserMessage(steeringBody, { deliverAs: "steer" });
  } catch (err) {
@@ -1300,6 +1307,7 @@ export default function (pi: ExtensionAPI): void {
  if (haystack && SIGNATURE_REGEX.test(haystack)) {
  compilerFailStreak += 1;
  cleanBuildStreak = 0; // a new failure voids any pending verification
+ if (commandLine) lastFailedCommand = commandLine; // becomes the steer "Verify:" line
  } else {
  if (raw.length > 0) {
  compilerFailStreak = 0;
