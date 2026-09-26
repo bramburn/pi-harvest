@@ -35,10 +35,27 @@
  * or waiting for resolution. Network failures fall through the catch
  * + finally blocks of runAudit() and reset state to idle so the user
  * is never permanently blocked by a flaky verifier endpoint.
+ *
+ * Steering-quality hardening (post-Phase 8):
+ *   - Auto-audits (event-handler ctx, no navigateTree) queue a rewind
+ *     and self-dispatch "/harvest rewind"; pi executes extension
+ *     commands via prompt()->_tryExecuteExtensionCommand() with a fresh
+ *     command context (INCLUDING navigateTree), immediately, even
+ *     mid-stream. The steer lands AFTER the rewind so it can't be
+ *     pruned by the navigation.
+ *   - Audit resolution is gated: a bare clean bash (`ls`) no longer
+ *     resolves an audit. MaybeResolveAndHarvest requires >=
+ *     HARVEST_RESOLUTION_VERIFICATIONS clean build/test-shaped
+ *     commands (matched on the tool_result command line), with a
+ *     HARVEST_RESOLUTION_TIMEOUT_TURNS fallback so the state machine
+ *     can't jam when the worker never runs a build.
+ *   - Thrashing distillation steers the LIVE worker with the distilled
+ *     optimal completion — zero extra LLM calls (the one distiller
+ *     call already paid for the content).
  */
 
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
-import { extractNeatSlice, messageToText, extractToolResultText } from "./slice.js";
+import { extractNeatSlice, messageToText, extractToolResultText, enforcePayloadSize } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
 import { performSplice } from "./splice.js";
 import { captureActiveFileStates, extractGitDiff, inferDomainTags } from "./workspace.js";
@@ -95,6 +112,8 @@ interface LooseToolResult {
  toolName?: string;
  toolCallId?: string;
  details?: unknown;
+ /** Real pi's ToolResultEvent carries the invocation args in `input`. */
+ input?: Record<string, unknown>;
  content?: Array<{ type?: string; text?: string }> | string;
  isError?: boolean;
 }
@@ -155,7 +174,25 @@ const TURN_INTERVAL = Number(process.env.HARVEST_TURN_INTERVAL ?? "30");
 const STREAK_THRESHOLD = Number(process.env.HARVEST_STREAK_THRESHOLD ?? "3");
 const THRASHING_THRESHOLD = Number(process.env.HARVEST_THRASHING_THRESHOLD ?? "6");
 const SFT_TURN_LIMIT = Number(process.env.HARVEST_SFT_TURN_LIMIT ?? "2");
+// Resolution gate: how many clean build/test-shaped commands must run
+// after a steer before the audit counts as resolved (DPO pair sealed).
+// 0 disables the gate (legacy behavior: any clean bash resolves).
+const RESOLUTION_VERIFICATIONS = Number(process.env.HARVEST_RESOLUTION_VERIFICATIONS ?? "1");
+// Fallback: resolve an unresolved audit after this many turns with a
+// clean streak even if no build-shaped command ran (prevents the state
+// machine from jamming when the worker fixes the issue without ever
+// invoking a build). 0 disables the timeout.
+const RESOLUTION_TIMEOUT_TURNS = Number(process.env.HARVEST_RESOLUTION_TIMEOUT_TURNS ?? "8");
 const STATUS_KEY = "harvester";
+
+/**
+ * Commands that count as "verified the build" for audit resolution.
+ * Deliberately conservative — package-manager / test-runner / build-tool
+ * invocations only, matched against the tool_result command line. A
+ * clean `ls` must never resolve an audit.
+ */
+const BUILD_COMMAND_REGEX =
+ /(?:^|[\s;&|])(?:cargo\s+(?:build|test|check|clippy)|npm\s+(?:run\s+)?(?:build|test)|pnpm\s+(?:build|test)|yarn\s+(?:build|test)|npx\s+tsc|tsc|dotnet\s+(?:build|test|publish)|msbuild|flutter\s+(?:build|test)|pytest|python\s+-m\s+pytest|make|cmake\s+--build|gcc|g\+\+|clang\+\+|clang|go\s+(?:build|test)|rustc|mvn|gradlew)(?=\s|$)/i;
 
 type HarvesterState = "idle" | "auditing" | "awaiting_resolution";
 type TriggerReason = "compiler_streak" | "periodic_turn" | "manual" | "thrashing_distillation" | "semantic_review" | "architectural_opinion";
@@ -196,6 +233,14 @@ export default function (pi: ExtensionAPI): void {
  let lastDivergenceEntryId: string | null = null;
  let lastGitDiffSummary: string | null = null;
  let auditInFlight: Promise<void> | null = null;
+ // Resolution gate: number of clean build/test-shaped commands since
+ // the current steer (reset when an audit triggers and when it resolves).
+ let cleanBuildStreak = 0;
+ // Set when an auto-audit (event-handler ctx) queues a rewind that only
+ // a command-handler ctx can execute. Consumed by the "/harvest rewind"
+ // subcommand, which pi runs with a fresh command context (including
+ // navigateTree) even when dispatched from an event handler.
+ let pendingAutoRewind = false;
 
  // Phase 5: thrashing streak counter — number of consecutive turn_ends
  // where (a) toolResults.length >= THRASHING_THRESHOLD, (b) the final tool
@@ -220,6 +265,8 @@ export default function (pi: ExtensionAPI): void {
  turnCounter +
  " | Streak: " +
  compilerFailStreak +
+ " | Builds: " +
+ cleanBuildStreak +
  " | Harvests: " +
  harvestCount +
  " | SFT: " +
@@ -262,6 +309,18 @@ export default function (pi: ExtensionAPI): void {
  return (ctx.model.provider ?? "") + ":" + (ctx.model.id ?? ctx.model.name ?? "unknown");
  }
 
+ /**
+  * Extract the command line from a tool_result event. Real pi's
+  * ToolResultEvent carries the invocation in `input.command` (bash /
+  * powershell); the legacy mock shape and some tool events have none.
+  */
+ function extractCommandLine(event: unknown): string {
+ const e = event as { input?: { command?: unknown }; command?: unknown } | null;
+ if (!e || typeof e !== "object") return "";
+ const cmd = e.input?.command ?? e.command;
+ return typeof cmd === "string" ? cmd : "";
+ }
+
  function extractLatestAssistant(branch: SessionEntry[]): string {
  for (let i = branch.length - 1; i >= 0; i--) {
  const e = branch[i];
@@ -285,6 +344,7 @@ export default function (pi: ExtensionAPI): void {
  state = "auditing";
  lastTriggerReason = triggerReason;
  lastAuditedTurn = turnCounter;
+ cleanBuildStreak = 0; // resolution gate starts counting from the steer
  paint(ctx);
 
  try {
@@ -330,12 +390,40 @@ export default function (pi: ExtensionAPI): void {
 
  // SpliceHost: sendUserMessage comes from the extension API (always
  // available). navigateTree comes from the command context if present
- // (the event-handler ctx doesn't expose it; the rewind is silently
- // skipped in that case).
+ // (manual /harvest audit). Auto-audits fire from turn_end where the
+ // ExtensionContext has NO navigateTree — verified against the pi
+ // source (ExtensionCommandContext only). For those we queue the rewind
+ // and self-dispatch "/harvest rewind": pi's prompt() executes
+ // extension commands immediately via _tryExecuteExtensionCommand() with
+ // a fresh command context (INCLUDING navigateTree), even mid-stream.
+ // drainPendingRewind() then navigates FIRST and sends the steer AFTER,
+ // so the steer can't be pruned by the rewind.
+ if (typeof ctx.navigateTree === "function") {
  await performSplice(audit, slice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
- navigateTree: typeof ctx.navigateTree === "function" ? ctx.navigateTree.bind(ctx) : undefined,
+ navigateTree: ctx.navigateTree.bind(ctx),
  }, ctx);
+ } else if (audit.divergence_detected) {
+ pendingAutoRewind = true;
+ try {
+ pi.sendUserMessage("/harvest rewind", { expandPromptTemplates: true });
+ } catch (err) {
+ // Self-dispatch failed (minimal mock hosts, atypical pi builds):
+ // fall back to the steer-only splice rather than losing steering.
+ pendingAutoRewind = false;
+ const msg = (err as Error)?.message ?? String(err);
+ notify(ctx, "Auto-rewind dispatch failed: " + msg + " — applying steer-only splice", "warn");
+ await performSplice(audit, slice, {
+ sendUserMessage: pi.sendUserMessage.bind(pi),
+ navigateTree: undefined,
+ }, ctx);
+ }
+ } else {
+ await performSplice(audit, slice, {
+ sendUserMessage: pi.sendUserMessage.bind(pi),
+ navigateTree: undefined,
+ }, ctx);
+ }
  } catch (err) {
  if (err instanceof VerifierConfigError) {
  // Configuration error - no point retrying. Show a one-shot helpful
@@ -376,14 +464,65 @@ export default function (pi: ExtensionAPI): void {
  }
 
  /**
- * If a previous audit is awaiting resolution AND the streak just
- * dropped back to 0, the worker has fixed the issue — write a DPO
+ * Execute a rewind queued by an auto-audit. Auto-audits fire from
+ * turn_end where the ExtensionContext has no navigateTree; pi executes
+ * this subcommand via prompt()/_tryExecuteExtensionCommand() with a
+ * fresh ExtensionCommandContext that DOES have navigateTree — even when
+ * the dispatch originated from an event handler, and even mid-stream.
+ *
+ * The staged audit state (lastAudit/lastSlice) was captured at audit
+ * time; navigateTree rewinds to the divergence entry and performSplice
+ * sends the [STEER:K3] message only AFTER the navigation resolves, so
+ * the steer survives the rewind.
+ *
+ * Falls back to the steer-only splice when navigateTree is somehow
+ * still unavailable (defensive; real pi always provides it here).
+ */
+ async function drainPendingRewind(c: PiContext): Promise<void> {
+ if (!pendingAutoRewind) {
+ notify(c, "No rewind is pending", "info");
+ return;
+ }
+ pendingAutoRewind = false;
+ if (!lastAudit || !lastSlice) {
+ notify(c, "Rewind dropped: staged audit state is missing", "warn");
+ return;
+ }
+ await performSplice(lastAudit, lastSlice, {
+ sendUserMessage: pi.sendUserMessage.bind(pi),
+ navigateTree: typeof c.navigateTree === "function" ? c.navigateTree.bind(c) : undefined,
+ }, c);
+ }
+
+ /**
+ * If a previous audit is awaiting resolution AND the resolution gate
+ * is satisfied, the worker has fixed the issue — write a DPO
  * record and reset state to idle.
  */
  function maybeResolveAndHarvest(ctx: PiContext): boolean {
  if (state !== "awaiting_resolution") return false;
  if (!lastAudit || !lastSlice) return false;
- if (compilerFailStreak !== 0) return false;
+
+ // Resolution gate: a bare clean bash (e.g. `ls`) no longer proves the
+ // steer worked. Require >= RESOLUTION_VERIFICATIONS clean build/test-
+ // shaped commands since the steer (tracked in tool_result from the
+ // command line), with a turn-based timeout fallback so the state
+ // machine can't jam when the worker fixes the issue without ever
+ // running a build. RESOLUTION_VERIFICATIONS=0 restores legacy behavior.
+ const verified =
+  RESOLUTION_VERIFICATIONS <= 0 || cleanBuildStreak >= RESOLUTION_VERIFICATIONS;
+ const timedOut =
+  compilerFailStreak === 0 &&
+  RESOLUTION_TIMEOUT_TURNS > 0 &&
+  turnCounter - lastAuditedTurn >= RESOLUTION_TIMEOUT_TURNS;
+ if (!verified && !timedOut) return false;
+ if (!verified && timedOut) {
+ notify(
+  ctx,
+  "Audit resolving on timeout without a verified clean build — DPO pair quality may be lower",
+  "warn",
+ );
+ }
 
  const branch = ctx.sessionManager.getBranch();
  const chosen = extractLatestAssistant(branch);
@@ -430,6 +569,7 @@ export default function (pi: ExtensionAPI): void {
  lastReviewFeedback = null;
  lastOpinionQuery = null;
  lastError = null; // successful resolution
+ cleanBuildStreak = 0; // gate resets for the next audit cycle
  lastAuditedTurn = turnCounter;
  paint(ctx);
  return true;
@@ -440,7 +580,7 @@ export default function (pi: ExtensionAPI): void {
  // -------------------------------------------------------------------------
 
  pi.registerCommand("harvest", {
- description: "pi-harvest controls. Subcommands: status | audit | retry | review <feedback> | export [dpo|sft]",
+ description: "pi-harvest controls. Subcommands: status | audit | retry | rewind | review <feedback> | opinion [query] | export [dpo|sft]",
  handler: async (args, ctx) => {
  const rawArgs = (args ?? "").trim();
  const trimmed = rawArgs.toLowerCase();
@@ -454,6 +594,15 @@ export default function (pi: ExtensionAPI): void {
  }
  notify(c, "Manual audit requested", "info");
  runAudit(c, "manual");
+ return;
+ }
+
+ if (trimmed === "rewind") {
+ // Normally consumed automatically: auto-audits self-dispatch
+ // "/harvest rewind" right after the verifier responds. Reaching this
+ // with a pending rewind means the dispatch failed silently — drain it
+ // now that we (finally) have a command context.
+ await drainPendingRewind(c);
  return;
  }
 
@@ -828,6 +977,7 @@ export default function (pi: ExtensionAPI): void {
  state = "auditing";
  lastTriggerReason = "semantic_review";
  lastAuditedTurn = turnCounter;
+ cleanBuildStreak = 0; // resolution gate starts counting from the steer
  paint(c);
 
  try {
@@ -966,6 +1116,7 @@ export default function (pi: ExtensionAPI): void {
  state = "auditing";
  lastTriggerReason = "architectural_opinion";
  lastAuditedTurn = turnCounter;
+ cleanBuildStreak = 0; // resolution gate starts counting from the steer
  paint(c);
 
  try {
@@ -1083,6 +1234,24 @@ export default function (pi: ExtensionAPI): void {
  });
  harvestCount += 1;
  notify(c, "Distilled DPO pair saved (" + distilled.distilled_chosen_completion.length + " chars chosen)", "info");
+
+ // Steering the LIVE worker costs zero extra LLM calls — the distiller
+ // already produced the optimal completion for this exact thrash.
+ // Inject it as a Tier-3 steer so the worker stops thrashing instead of
+ // only feeding the sink. (Budget rule: still exactly one verifier call.)
+ const steerBody =
+  "[STEER:K3]\n" +
+  "Subtask: " + (slice.inceptionPrompt || "(current task)") + "\n" +
+  "Flaw: thrashing — " + thrashingStreak + " tool calls with repeated rework on the same file(s)\n" +
+  "Optimal path (supervisor-distilled single-turn solution):\n" +
+  enforcePayloadSize(distilled.distilled_chosen_completion, 16 * 1024);
+ try {
+  pi.sendUserMessage(steerBody, { deliverAs: "steer" });
+  notify(c, "Steered worker with distilled optimal path", "info");
+ } catch (err) {
+  const msg = (err as Error)?.message ?? String(err);
+  notify(c, "Distillation steer failed to send: " + msg, "warn");
+ }
  } catch (err) {
  if (err instanceof VerifierConfigError) {
  // Distillation is background/non-blocking; silently vamoose on config
@@ -1126,11 +1295,20 @@ export default function (pi: ExtensionAPI): void {
 
  const raw = extractToolResultText(event);
  const haystack = raw.toLowerCase();
+ const commandLine = extractCommandLine(event);
 
  if (haystack && SIGNATURE_REGEX.test(haystack)) {
  compilerFailStreak += 1;
+ cleanBuildStreak = 0; // a new failure voids any pending verification
  } else {
- if (raw.length > 0) compilerFailStreak = 0;
+ if (raw.length > 0) {
+ compilerFailStreak = 0;
+ // Only build/test-shaped commands count toward the resolution gate —
+ // a clean `ls` proves nothing about the fix.
+ if (BUILD_COMMAND_REGEX.test(commandLine)) {
+ cleanBuildStreak += 1;
+ }
+ }
  }
 
  // Phase 7: zero-shot success mining. Fire ONLY when:

@@ -9,7 +9,7 @@
 
 | File | Purpose |
 |------|---------|
-| `tests/smoke.js` | Drives a mock `pi` runtime through 7 scenarios (clean output, rust errors ×3, streak reset, non-bash tools ignored, case-insensitive scan, 30-turn interval). Run with `node tests/smoke.js`. **Not** shipped with the npm package — `package.json`'s `files` whitelist excludes `tests/`. |
+| `tests/smoke.js` | End-to-end flow test against a mock `pi` runtime: 3-failure streak → auto-audit → self-dispatched rewind → steer → gated resolution → thrashing distillation → manual audit → export. Run with `node tests/smoke.js`. **Not** shipped with the npm package — `package.json`'s `files` whitelist excludes `tests/`. |
 
 The directory exists **only** to hold manual / scripted smoke tests for the compiled extension. Phase 2+ may add per-module unit tests here (e.g. `verifier-client.test.js`) but no formal test runner is wired yet.
 
@@ -88,7 +88,28 @@ These are the scenarios `tests/smoke.js` already covers. **Every new feature mus
 
 ---
 
-## 4. Scenarios to add for Phase 2+
+## 4. Steering-hardening scenarios (current smoke flow)
+
+`tests/smoke.js` now runs as one sequential flow. Each numbered section below **must keep passing**; the script exits non-zero on the first failure.
+
+| # | Scenario | What it proves |
+|---|----------|----------------|
+| 1 | 3× `cargo build` failures (with `input.command`) + `turn_end` | Auto-audit fires **exactly once** (one verifier HTTP call). The event-handler ctx has no `navigateTree`, so the extension self-dispatches `/harvest rewind` via `sendUserMessage(content, { expandPromptTemplates: true })`; the mock executes it with a fresh command ctx and the rewind lands (`navigateTree` called with `targetId: "t1"`, `summarize: true`). The `[STEER:K3]` steer is sent **after** the navigation, with `deliverAs: "steer"`. No "Rewind skipped" fallback notify. |
+| 2 | Clean `ls -la` + `turn_end`, then clean `cargo build` + `turn_end` | **Resolution gate**: the bare `ls` does NOT resolve the audit (no JSONL after 300 ms); the build-shaped command satisfies `HARVEST_RESOLUTION_VERIFICATIONS` and the DPO record is written. |
+| 3 | `/harvest status` | Status widget text: counters, verifier model, sink stats, telemetry (`logic_error (1)`), `state=idle`. |
+| 4 | `turn_end` with 4 toolResults (bash + 2× edit on same file + clean bash), `HARVEST_THRASHING_THRESHOLD=3` | Thrashing detected → distiller called exactly once → distillation DPO record (`trigger_reason: "thrashing_distillation"`) AND a live-worker steer containing `[STEER:K3]`, the distilled completion, and `deliverAs: "steer"`. |
+| 5 | `/harvest audit` with a command ctx that has `navigateTree` | Manual audit uses the ctx's `navigateTree` **directly** (no self-dispatch); second navigation recorded; status shows `state=awaiting_resolution`. |
+| 6 | Clean `cargo build` + `turn_end` → `/harvest export dpo` | Manual audit resolves through the gate; export file exists with 3 HF-format DPO records. |
+| 7 | Sink filename | `trajectories_YYYY_MM.jsonl` monthly rotation. |
+
+Mock notes:
+
+- `sendUserMessage` emulates real pi's `prompt()`: when `expandPromptTemplates: true` and the content starts with `/`, the registered command's handler runs immediately with a fresh command ctx (including `navigateTree`) — this is what makes scenario 1 possible. Command-handler errors land in `calls.commandErrors` and must stay empty.
+- The mock verifier routes on the request's system prompt: `/Hindsight Relabeling/` → distiller response, otherwise audit response.
+
+---
+
+## 5. Scenarios to add for future phases
 
 When the verifier client lands, extend the catalogue with:
 
@@ -129,7 +150,7 @@ node tests/smoke.js
 
 ### Expected output
 
-A series of `--- Test N: ... ---` headers followed by the final `=== Captured calls ===` block. The last `setStatus` line should read `[Harvester] Turn: 30 | Streak: 0` (or similar — the periodic trigger resets the streak to 0 before the widget re-renders).
+A single `Steering-hardening smoke test PASSED` line followed by a summary block (DPO path, record count, audit/distiller call counts, rewind navigations). The final status widget should read `[Harvester] Turn: N | Streak: 0 | ... | State: idle`.
 
 ### What "green" means for a phase
 

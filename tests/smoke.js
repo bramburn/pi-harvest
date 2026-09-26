@@ -1,13 +1,20 @@
 /**
- * Integration smoke test (Phase 2 + Phase 3).
+ * Integration smoke test (Phases 2-4 + steering-quality hardening).
  *
  * Boots the compiled extension against a fully-mocked pi runtime:
  * - drives a 3-failure compile streak
- * - intercepts the HTTP call to the Verifier via a local mock server
- * - asserts navigateTree + sendUserMessage fire
- * - verifies a HarvestedTrajectoryRecord lands in .pi/harvest/trajectories.jsonl
- * - exercises /harvest status and /harvest audit slash commands
+ * - intercepts the HTTP calls to the Verifier/Distiller via a local mock server
+ * - asserts the AUTO-audit path self-dispatches "/harvest rewind" and
+ *   navigates via a command context (hardening #1)
+ * - asserts a clean `ls` does NOT resolve the audit but a clean
+ *   `cargo build` does (hardening #2)
+ * - asserts thrashing distillation steers the live worker with the
+ *   distilled optimal path (hardening #3)
+ * - exercises /harvest status, audit, rewind, export
  */
+
+// Module-level env: the extension reads thresholds at load time.
+process.env.HARVEST_THRASHING_THRESHOLD = "3";
 
 const http = require("node:http");
 const fs = require("node:fs");
@@ -31,20 +38,21 @@ async function startMockVerifier(responder) {
  });
 }
 
-// mock-only fixture using legacy { toolName, output } shape; real pi
+// mock-only fixture using legacy { toolName, output } shape for the
+// tool_result events plus real-shaped turn_end toolResults; real pi
 // emits ToolResultEvent with content: Array<TextContent | ImageContent>
-// and this scenario exercises the legacy fallback branch of
-// extractToolResultText only.
+// and input.command — the scenarios mix both shapes on purpose.
 function makePi() {
  const handlers = {};
- const calls = { sendUserMessage: [], navigateTree: [] };
+ const calls = { sendUserMessage: [], navigateTree: [], commandErrors: [] };
  const commands = {};
  const notifyCalls = [];
- return {
- handlers,
- calls,
- commands,
- notifyCalls,
+ let lastCtx = null;
+ const pi = {
+ handlers: handlers,
+ calls: calls,
+ commands: commands,
+ notifyCalls: notifyCalls,
  on(event, handler) {
  handlers[event] = handler;
  },
@@ -53,23 +61,63 @@ function makePi() {
  },
  sendUserMessage(content, options) {
  calls.sendUserMessage.push({ content: content, options: options });
+ // Emulate real pi's prompt() (agent-session.ts): when
+ // expandPromptTemplates is set and the text starts with "/", the
+ // extension command executes IMMEDIATELY with a fresh command
+ // context (including navigateTree) — even when the origin was an
+ // event handler whose ctx lacks navigateTree, and even mid-stream.
+ if (
+ options &&
+ options.expandPromptTemplates === true &&
+ typeof content === "string" &&
+ content.startsWith("/")
+ ) {
+ const spaceIndex = content.indexOf(" ");
+ const name = spaceIndex === -1 ? content.slice(1) : content.slice(1, spaceIndex);
+ const args = spaceIndex === -1 ? "" : content.slice(spaceIndex + 1);
+ const command = commands[name];
+ if (command) {
+ const base = lastCtx || {};
+ const commandCtx = {
+ cwd: base.cwd || "",
+ model: base.model,
+ hasUI: true,
+ ui: base.ui || {
+ setStatus: function () {},
+ notify: function () {},
  },
- // Note: in real pi, navigateTree lives on ExtensionCommandContext (the
- // ctx passed to slash-command handlers), NOT on ExtensionAPI (the pi
- // object). The smoke ctx mock must expose it on ctx.
- _navigateTree(targetId, options) {
- return calls.navigateTree;
+ sessionManager: base.sessionManager || {
+ getBranch: function () {
+ return [];
+ },
+ getSessionId: function () {
+ return "mock";
+ },
+ },
+ navigateTree: function (targetId, navOptions) {
+ calls.navigateTree.push({ targetId: targetId, options: navOptions });
+ return Promise.resolve({ cancelled: false });
+ },
+ };
+ Promise.resolve(command.handler(args, commandCtx)).catch(function (err) {
+ calls.commandErrors.push(err && err.message ? err.message : String(err));
+ });
+ }
+ }
  },
  _fire(event, eventObj, ctx) {
+ lastCtx = ctx;
  if (handlers[event]) {
  return handlers[event](eventObj, ctx);
  }
  },
  _callCommand(name, args, ctx) {
+ lastCtx = ctx;
  if (!commands[name]) throw new Error("no command: " + name);
  return commands[name].handler(args, ctx);
  },
  };
+ return pi;
 }
 
 function wait(ms) {
@@ -88,6 +136,10 @@ async function waitFor(predicate, opts) {
  throw new Error("waitFor: timed out");
 }
 
+function readJsonl(jsonlPath) {
+ return fs.readFileSync(jsonlPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
 async function main() {
  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harvest-smoke-"));
  const d = new Date();
@@ -95,9 +147,21 @@ async function main() {
  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
  const jsonlPath = path.join(cwd, ".pi", "harvest", "trajectories_" + y + "_" + m + ".jsonl");
 
- let lastAudited = 0;
- const mock = await startMockVerifier(function (_req, res) {
- lastAudited += 1;
+ let auditCalls = 0;
+ let distillerCalls = 0;
+ const mock = await startMockVerifier(function (_req, res, body) {
+ const parsed = JSON.parse(body);
+ const systemPrompt = parsed.messages && parsed.messages[0] ? parsed.messages[0].content : "";
+ if (/Hindsight Relabeling/.test(systemPrompt)) {
+ distillerCalls += 1;
+ const distilled = {
+ distilled_chosen_completion: 'fn main() { println!("distilled hello"); }',
+ };
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(distilled) } }] }));
+ return;
+ }
+ auditCalls += 1;
  const audit = {
  inferred_subtask: "build hello world in rust",
  divergence_detected: true,
@@ -163,52 +227,69 @@ async function main() {
  return "sess-smoke-1";
  },
  },
- // Mirror real pi: navigateTree lives on ExtensionCommandContext (the ctx).
- // The smoke test exercises the compiler-streak path which fires from
- // turn_end, where ctx is an ExtensionContext without navigateTree. So
- // for this path we expect rewind to be skipped; the steer-only splice
- // still lands via sendUserMessage. Manual /harvest audit would exercise
- // the command ctx path and would have navigateTree.
+ // Mirror real pi: navigateTree lives on ExtensionCommandContext (the
+ // ctx passed to slash-command handlers), NOT on ExtensionContext (the
+ // ctx passed to turn_end / tool_result event handlers).
  navigateTree: undefined,
  };
 
  extension(pi);
 
  // -----------------------------------------------------------------------
- // 1. Existing Phase 2 flow: 3-failure streak -> audit -> steer -> resolve
+ // 1. 3-failure streak -> auto-audit -> SELF-DISPATCHED rewind -> steer
  // -----------------------------------------------------------------------
  for (let i = 0; i < 3; i++) {
  pi._fire(
  "tool_result",
- { toolName: "bash", output: "error[E0425]: failure " + (i + 1) },
+ {
+ toolName: "bash",
+ input: { command: "cargo build" },
+ output: "error[E0425]: failure " + (i + 1),
+ },
  ctx,
  );
  }
  pi._fire("turn_end", {}, ctx);
 
  await waitFor(function () {
- return lastAudited === 1;
+ return auditCalls === 1;
+ }, { timeoutMs: 4000 });
+
+ // Hardening #1: the auto-audit (event-handler ctx, no navigateTree)
+ // must self-dispatch "/harvest rewind", which the mock executes with a
+ // fresh command context — so the rewind NOW happens on the auto path
+ // too, and the steer lands AFTER the navigation.
+ await waitFor(function () {
+ return pi.calls.navigateTree.length === 1;
  }, { timeoutMs: 4000 });
 
  await waitFor(function () {
- return pi.calls.sendUserMessage.length === 1;
+ return pi.calls.sendUserMessage.length >= 2;
  }, { timeoutMs: 4000 });
 
- const steering = pi.calls.sendUserMessage[0];
+ assert.equal(pi.calls.sendUserMessage[0].content, "/harvest rewind");
+ assert.equal(pi.calls.sendUserMessage[0].options.expandPromptTemplates, true);
+ assert.equal(pi.calls.navigateTree[0].targetId, "t1");
+ assert.equal(pi.calls.navigateTree[0].options.summarize, true);
+ assert.match(pi.calls.navigateTree[0].options.customInstructions, /Add `;`/);
+
+ const steering = pi.calls.sendUserMessage[1];
  assert.match(steering.content, /\[STEER:K3\]/);
  assert.match(steering.content, /Add `;`/);
  assert.equal(steering.options.deliverAs, "steer");
 
- // Auto-audit fires from turn_end; ExtensionContext doesn't expose
- // navigateTree there, so the rewind is silently skipped and only the
- // steer message lands. The command-ctx path (manual /harvest audit)
- // exercises navigateTree below.
- assert.equal(pi.calls.navigateTree.length, 0);
- const skipNotify = pi.notifyCalls.find(function (m) {
+ // No steer-only fallback notify, no command-dispatch errors.
+ assert.equal(pi.calls.commandErrors.length, 0);
+ assert.ok(
+ !pi.notifyCalls.find(function (m) {
  return /Rewind skipped/.test(m);
- });
- assert.ok(skipNotify, "expected a 'Rewind skipped' notification on the auto-audit path");
+ }),
+ "auto-audit path must no longer fall back to steer-only splice",
+ );
 
+ // -----------------------------------------------------------------------
+ // 2. Resolution gate: clean `ls` does NOT resolve; clean build does
+ // -----------------------------------------------------------------------
  branch.push({
  type: "message",
  id: "a2",
@@ -217,7 +298,14 @@ async function main() {
  message: { role: "assistant", content: "fn main() { println!('hello'); }" },
  });
 
- pi._fire("tool_result", { toolName: "bash", output: "Build succeeded." }, ctx);
+ // A clean non-build command must not satisfy the resolution gate.
+ pi._fire("tool_result", { toolName: "bash", input: { command: "ls -la" }, output: "main.rs Cargo.toml" }, ctx);
+ pi._fire("turn_end", {}, ctx);
+ await wait(300);
+ assert.ok(!fs.existsSync(jsonlPath), "clean `ls` must not resolve the audit (resolution gate)");
+
+ // A clean build/test-shaped command satisfies it.
+ pi._fire("tool_result", { toolName: "bash", input: { command: "cargo build" }, output: "Build succeeded." }, ctx);
  pi._fire("turn_end", {}, ctx);
 
  await waitFor(function () {
@@ -225,11 +313,11 @@ async function main() {
  }, { timeoutMs: 4000 });
 
  // -----------------------------------------------------------------------
- // 2. Phase 3 schema assertions on the JSONL line
+ // 3. Schema assertions on the first JSONL record
  // -----------------------------------------------------------------------
- const lines = fs.readFileSync(jsonlPath, "utf8").trim().split("\n");
- assert.equal(lines.length, 1);
- const entry = JSON.parse(lines[0]);
+ const records = readJsonl(jsonlPath);
+ assert.equal(records.length, 1);
+ const entry = records[0];
 
  assert.equal(entry.session_id, "sess-smoke-1");
  assert.match(entry.timestamp, /^\d{4}-\d{2}-\d{2}T/);
@@ -250,7 +338,7 @@ async function main() {
  assert.ok("git_diff_summary" in entry, "git_diff_summary must be present (null is OK)");
 
  // -----------------------------------------------------------------------
- // 3. Phase 3 slash commands: /harvest status
+ // 4. /harvest status
  // -----------------------------------------------------------------------
  assert.ok(pi.commands["harvest"], "registerCommand should have been called with 'harvest'");
  assert.equal(typeof pi.commands["harvest"].handler, "function");
@@ -274,10 +362,48 @@ async function main() {
  assert.match(statusMsg, /logic_error \(1\)/);
 
  // -----------------------------------------------------------------------
- // 4. Phase 3 slash commands: /harvest audit (manual trigger)
+ // 5. Thrashing -> distillation DPO + LIVE-WORKER steer (hardening #3)
  // -----------------------------------------------------------------------
- // Simulate the command-handler ctx (real pi's ExtensionCommandContext
- // includes navigateTree; the event-handler ctx does not).
+ pi.notifyCalls.length = 0;
+ pi._fire("turn_end", {
+ toolResults: [
+ { toolName: "bash", content: [{ type: "text", text: "compiling v0.1.0 ..." }], isError: false },
+ { toolName: "edit", details: { path: "src/main.rs" } },
+ { toolName: "edit", details: { path: "src/main.rs" } },
+ { toolName: "bash", content: [{ type: "text", text: "Build finished" }], isError: false },
+ ],
+ }, ctx);
+
+ await waitFor(function () {
+ return distillerCalls === 1;
+ }, { timeoutMs: 4000 });
+
+ await waitFor(function () {
+ return readJsonl(jsonlPath).length >= 2;
+ }, { timeoutMs: 4000 });
+
+ await waitFor(function () {
+ return pi.calls.sendUserMessage.some(function (m) {
+ return /Optimal path/.test(m.content);
+ });
+ }, { timeoutMs: 4000 });
+
+ const distSteer = pi.calls.sendUserMessage.find(function (m) {
+ return /Optimal path/.test(m.content);
+ });
+ assert.match(distSteer.content, /\[STEER:K3\]/);
+ assert.match(distSteer.content, /distilled hello/);
+ assert.match(distSteer.content, /thrashing/i);
+ assert.equal(distSteer.options.deliverAs, "steer");
+
+ const distRecord = readJsonl(jsonlPath)[1];
+ assert.equal(distRecord.trigger_reason, "thrashing_distillation");
+ assert.equal(distRecord.chosen_completion, 'fn main() { println!("distilled hello"); }');
+ assert.match(distRecord.rejected_completion, /fn main/);
+
+ // -----------------------------------------------------------------------
+ // 6. Manual /harvest audit (command ctx) -> direct navigateTree path
+ // -----------------------------------------------------------------------
  const commandCtx = Object.assign({}, ctx, {
  navigateTree: function (targetId, options) {
  pi.calls.navigateTree.push({ targetId: targetId, options: options });
@@ -288,18 +414,20 @@ async function main() {
  pi.notifyCalls.length = 0;
  await pi._callCommand("harvest", "audit", commandCtx);
  await waitFor(function () {
- return lastAudited === 2;
+ return auditCalls === 2;
  }, { timeoutMs: 4000 });
  const auditMsg = pi.notifyCalls.find(function (m) {
  return /Manual audit requested/.test(m);
  });
  assert.ok(auditMsg, "audit command should emit a 'Manual audit requested' notification");
 
- // Manual audit fires from the slash-command handler, so navigateTree IS
- // available on the command ctx. Verify the rewind happened.
- assert.equal(pi.calls.navigateTree.length, 1);
- assert.equal(pi.calls.navigateTree[0].targetId, "t1");
- assert.equal(pi.calls.navigateTree[0].options.summarize, true);
+ // Manual audit fires from the slash-command handler, so navigateTree is
+ // used directly from the passed ctx (no self-dispatch on this path).
+ await waitFor(function () {
+ return pi.calls.navigateTree.length === 2;
+ }, { timeoutMs: 4000 });
+ assert.equal(pi.calls.navigateTree[1].targetId, "t1");
+ assert.equal(pi.calls.navigateTree[1].options.summarize, true);
 
  // Status after manual audit should show awaiting_resolution state.
  pi.notifyCalls.length = 0;
@@ -311,9 +439,9 @@ async function main() {
  assert.match(afterMsg, /state=awaiting_resolution/);
 
  // -----------------------------------------------------------------------
- // 5. Phase 4: /harvest export dpo
+ // 7. /harvest export dpo (3 records by now)
  // -----------------------------------------------------------------------
- // First resolve the manual audit by giving the worker a clean compile.
+ // First resolve the manual audit by giving the worker a clean build.
  branch.push({
  type: "message",
  id: "a3",
@@ -321,11 +449,11 @@ async function main() {
  timestamp: "2026-01-01T00:00:04.000Z",
  message: { role: "assistant", content: "fn main() { println!('manual hello'); }" },
  });
- pi._fire("tool_result", { toolName: "bash", output: "Build succeeded." }, ctx);
+ pi._fire("tool_result", { toolName: "bash", input: { command: "cargo build" }, output: "Build succeeded." }, ctx);
  pi._fire("turn_end", {}, ctx);
 
  await waitFor(function () {
- return fs.existsSync(jsonlPath) && fs.readFileSync(jsonlPath, "utf8").trim().split("\n").length >= 2;
+ return readJsonl(jsonlPath).length >= 3;
  }, { timeoutMs: 4000 });
 
  pi.notifyCalls.length = 0;
@@ -341,7 +469,7 @@ async function main() {
 
  // Validate HF DPO format on the export
  const exportLines = fs.readFileSync(exportPath, "utf8").trim().split("\n");
- assert.equal(exportLines.length, 2);
+ assert.equal(exportLines.length, 3);
  for (const line of exportLines) {
  const rec = JSON.parse(line);
  assert.equal(rec.prompt.length, 1);
@@ -358,12 +486,12 @@ async function main() {
  }
 
  // -----------------------------------------------------------------------
- // 6. Phase 4: log rotation — the sink filename should be date-stamped
+ // 8. Log rotation — the sink filename should be date-stamped
  // -----------------------------------------------------------------------
  assert.match(jsonlPath, /trajectories_\d{4}_\d{2}\.jsonl$/);
 
- console.log("Phase 2 + Phase 3 + Phase 4 smoke test PASSED");
- console.log(" DPO entry written: " + jsonlPath);
+ console.log("Steering-hardening smoke test PASSED");
+ console.log(" DPO entries written: " + jsonlPath + " (" + readJsonl(jsonlPath).length + " records)");
  console.log(" session_id: " + entry.session_id);
  console.log(" worker_model: " + entry.worker_model);
  console.log(" verifier_model: " + entry.verifier_model);
@@ -373,7 +501,9 @@ async function main() {
  console.log(" k3_audit.divergence_entry_id: " + entry.k3_audit.divergence_entry_id);
  console.log(" rejected: " + entry.rejected_completion);
  console.log(" chosen: " + entry.chosen_completion);
- console.log(" manual audit HTTP calls: " + lastAudited);
+ console.log(" auto-audit HTTP calls: " + auditCalls);
+ console.log(" distiller HTTP calls: " + distillerCalls);
+ console.log(" rewind navigations: " + pi.calls.navigateTree.length);
  } finally {
  mock.server.close();
  fs.rmSync(cwd, { recursive: true, force: true });
@@ -381,10 +511,11 @@ async function main() {
  delete process.env.VERIFIER_API_KEY;
  delete process.env.VERIFIER_MODEL;
  delete process.env.HARVEST_STREAK_THRESHOLD;
+ delete process.env.HARVEST_THRASHING_THRESHOLD;
  }
 }
 
 main().catch(function (err) {
- console.error("Phase 3 smoke test FAILED:", err);
+ console.error("Smoke test FAILED:", err);
  process.exit(1);
 });
