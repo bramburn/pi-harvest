@@ -409,6 +409,23 @@ export default function (pi: ExtensionAPI): void {
  }, ctx, { failedCommand: lastFailedCommand });
  } else if (audit.divergence_detected) {
  pendingAutoRewind = true;
+ // BUG CLASS — Pi mid-stream navigateTree guard: real pi rejects
+ // ctx.navigateTree(...) with "Wait for the current response to finish
+ // before navigating the session tree." while a response is still in
+ // progress. The auto-audit runs inside the turn_end handler, which
+ // is still inside the response Pi considers "current"; the immediate
+ // self-dispatch below trips that guard and the rejection surfaces as
+ // "[Harvester] navigateTree failed: ..." (src/splice.ts:223).
+ //
+ // FIX: defer the dispatch via queueMicrotask so it fires after the
+ // turn_end handler returns to Pi's event loop and Pi clears its
+ // "current response" flag — navigateTree then sees a clean state.
+ //
+ // ORDERING INVARIANT (preserved): drainPendingRewind navigates
+ // FIRST, then performSplice sends the [STEER:K3] message AFTER the
+ // navigation resolves. Deferring the dispatch doesn't change that
+ // sequence; it only moves it out of the current call stack.
+ queueMicrotask(() => {
  try {
  pi.sendUserMessage("/harvest rewind", { expandPromptTemplates: true });
  } catch (err) {
@@ -417,11 +434,23 @@ export default function (pi: ExtensionAPI): void {
  pendingAutoRewind = false;
  const msg = (err as Error)?.message ?? String(err);
  notify(ctx, "Auto-rewind dispatch failed: " + msg + " — applying steer-only splice", "warn");
- await performSplice(audit, slice, {
- sendUserMessage: pi.sendUserMessage.bind(pi),
- navigateTree: undefined,
- }, ctx, { failedCommand: lastFailedCommand });
+ // Fire-and-forget: we're outside any await context (inside a
+ // microtask) so the outer runAudit rejection handler can't observe
+ // this performSplice. Catch its rejection locally so it doesn't
+ // surface as an unhandled microtask rejection on the verifier-API
+ // fallback path.
+ void performSplice(
+ audit,
+ slice,
+ { sendUserMessage: pi.sendUserMessage.bind(pi), navigateTree: undefined },
+ ctx,
+ { failedCommand: lastFailedCommand },
+ ).catch((spliceErr) => {
+ const sMsg = (spliceErr as Error)?.message ?? String(spliceErr);
+ notify(ctx, "Steer-only splice fallback failed: " + sMsg, "warn");
+ });
  }
+ });
  } else {
  await performSplice(audit, slice, {
  sendUserMessage: pi.sendUserMessage.bind(pi),
