@@ -48,6 +48,13 @@ function makePi() {
  const commands = {};
  const notifyCalls = [];
  let lastCtx = null;
+ // Mid-stream navigateTree guard simulator. When > 0, the next
+ // navigateTree call(s) will reject with the same error real pi emits
+ // when the rewind lands during an active response ("Wait for the
+ // current response to finish before navigating the session tree.").
+ // Used by scenario 1b to verify the queueMicrotask deferral handles
+ // the rejection gracefully without crashing the extension.
+ let navigateTreeGuardRemaining = 0;
  const pi = {
  handlers: handlers,
  calls: calls,
@@ -96,6 +103,12 @@ function makePi() {
  },
  navigateTree: function (targetId, navOptions) {
  calls.navigateTree.push({ targetId: targetId, options: navOptions });
+ if (navigateTreeGuardRemaining > 0) {
+ navigateTreeGuardRemaining -= 1;
+ return Promise.reject(
+ new Error("Wait for the current response to finish before navigating the session tree."),
+ );
+ }
  return Promise.resolve({ cancelled: false });
  },
  };
@@ -115,6 +128,9 @@ function makePi() {
  lastCtx = ctx;
  if (!commands[name]) throw new Error("no command: " + name);
  return commands[name].handler(args, ctx);
+ },
+ setNavigateTreeGuard(remaining) {
+ navigateTreeGuardRemaining = remaining;
  },
  };
  return pi;
@@ -291,6 +307,194 @@ async function main() {
  }),
  "auto-audit path must no longer fall back to steer-only splice",
  );
+
+ // -----------------------------------------------------------------------
+ // 1b. Mid-stream navigateTree guard: rejection is caught, no crash,
+ // audit remains in awaiting_resolution, and the deferred rewind
+ // eventually lands on retry. Uses a fresh pi + fresh mock verifier so
+ // the audit/navigateTree counters in scenario 1 don't drift.
+ // -----------------------------------------------------------------------
+ let guardAuditCalls = 0;
+ const guardMock = await startMockVerifier(function (_req, res, _body) {
+ guardAuditCalls += 1;
+ const audit = {
+ inferred_subtask: "build hello world in rust",
+ divergence_detected: true,
+ divergence_turn_entry_id: "t1b",
+ flaw_category: "logic_error",
+ root_cause: "missing semicolon",
+ discard_advice: "drop turns 2-3",
+ steering_instructions: "Add `;` at end of statement.",
+ domain_tags: ["rust"],
+ };
+ res.writeHead(200, { "Content-Type": "application/json" });
+ res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(audit) } }] }));
+ });
+ const savedBaseUrl = process.env.VERIFIER_BASE_URL;
+ process.env.VERIFIER_BASE_URL = guardMock.baseUrl;
+ let cwd1b;
+ try {
+ const pi1b = makePi();
+ // First navigateTree call (the deferred rewind from cycle 1) rejects
+ // with the exact message real pi emits when the rewind lands during
+ // an active response. Subsequent calls succeed.
+ pi1b.setNavigateTreeGuard(1);
+
+ const branch1b = [
+ {
+ type: "message",
+ id: "u1b",
+ parentId: null,
+ timestamp: "2026-01-01T00:00:00.000Z",
+ message: { role: "user", content: "build me a hello world rust program" },
+ },
+ {
+ type: "message",
+ id: "a1b",
+ parentId: "u1b",
+ timestamp: "2026-01-01T00:00:01.000Z",
+ message: { role: "assistant", content: "fn main() { println!('hi') }" },
+ },
+ {
+ type: "message",
+ id: "t1b",
+ parentId: "a1b",
+ timestamp: "2026-01-01T00:00:02.000Z",
+ message: { role: "tool", toolName: "bash", content: "error[E0425]: cannot find value x" },
+ },
+ ];
+ cwd1b = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harvest-smoke-1b-"));
+ const jsonlPath1b = path.join(
+ cwd1b,
+ ".pi",
+ "harvest",
+ "trajectories_" + y + "_" + m + ".jsonl",
+ );
+ const ctx1b = {
+ cwd: cwd1b,
+ model: { id: "MiniMax-M3", provider: "minimax" },
+ ui: {
+ setStatus: function () {},
+ notify: function (msg) {
+ pi1b.notifyCalls.push(msg);
+ },
+ },
+ sessionManager: {
+ getBranch: function () {
+ return branch1b;
+ },
+ getSessionId: function () {
+ return "sess-smoke-1b";
+ },
+ },
+ // Mirror real pi: event-handler ctx has no navigateTree.
+ navigateTree: undefined,
+ };
+ extension(pi1b);
+
+ // Cycle 1: 3 failures -> auto-audit -> deferred rewind dispatches ->
+ // navigateTree rejects with the mid-stream guard message.
+ for (let i = 0; i < 3; i++) {
+ pi1b._fire(
+ "tool_result",
+ { toolName: "bash", input: { command: "cargo build" }, output: "error[E0425]: failure " + (i + 1) },
+ ctx1b,
+ );
+ }
+ pi1b._fire("turn_end", {}, ctx1b);
+
+ await waitFor(function () {
+ return pi1b.calls.navigateTree.length >= 1;
+ }, { timeoutMs: 4000 });
+ // Give the rejection's catch handler a tick to emit the warning.
+ await wait(100);
+ assert.equal(
+ pi1b.calls.navigateTree.length,
+ 1,
+ "cycle 1: deferred rewind attempted exactly one navigateTree call before the guard rejected",
+ );
+ assert.ok(
+ pi1b.notifyCalls.find(function (m) {
+ return /navigateTree failed/.test(m);
+ }),
+ "cycle 1: rejection must surface as a [Harvester] navigateTree failed warning, not a crash",
+ );
+ assert.equal(
+ pi1b.calls.commandErrors.length,
+ 0,
+ "cycle 1: rejection must not propagate as a command error (graceful fallback)",
+ );
+
+ // Cycle 2: user manually retries via /harvest audit. The command
+ // handler runs with a fresh command ctx (real pi provides navigateTree
+ // here), and the mock's guard counter is already 0 so the rewind
+ // succeeds. This is the realistic retry path: a user sees the
+ // [Harvester] navigateTree failed warning and re-runs the audit.
+ // (The state machine would otherwise keep the audit pinned in
+ // awaiting_resolution until resolution, so a second auto-audit can't
+ // fire without a clean build first.)
+ pi1b.notifyCalls.length = 0;
+ const commandCtx1b = Object.assign({}, ctx1b, {
+ navigateTree: function (targetId, options) {
+ pi1b.calls.navigateTree.push({ targetId: targetId, options: options });
+ return { cancelled: false };
+ },
+ });
+ await pi1b._callCommand("harvest", "audit", commandCtx1b);
+ await waitFor(function () {
+ return guardAuditCalls >= 2 && pi1b.calls.navigateTree.length >= 2;
+ }, { timeoutMs: 4000 });
+ assert.equal(
+ pi1b.calls.navigateTree.length,
+ 2,
+ "cycle 2: /harvest audit rewind landed (mock succeeded after first guard call consumed)",
+ );
+
+ // Cycle 3: worker fixes the issue; clean cargo build resolves the
+ // audit and writes the DPO pair. Verifies the bug fix doesn't break
+ // the resolution path - the DPO entry still gets sealed even when the
+ // first rewind attempt was rejected by the guard.
+ branch1b.push({
+ type: "message",
+ id: "a3b",
+ parentId: "t2b",
+ timestamp: "2026-01-01T00:00:05.000Z",
+ message: { role: "assistant", content: "fn main() { println!('hello'); }" },
+ });
+ pi1b._fire(
+ "tool_result",
+ { toolName: "bash", input: { command: "cargo build" }, output: "Build succeeded." },
+ ctx1b,
+ );
+ pi1b._fire("turn_end", {}, ctx1b);
+
+ await waitFor(function () {
+ return fs.existsSync(jsonlPath1b);
+ }, { timeoutMs: 4000 });
+ const records1b = readJsonl(jsonlPath1b);
+ assert.equal(
+ records1b.length,
+ 1,
+ "DPO pair still gets written after a mid-stream guard rejection",
+ );
+ assert.equal(records1b[0].session_id, "sess-smoke-1b");
+ // The DPO entry was sealed by the /harvest audit from cycle 2 (the
+ // retry), so trigger_reason is "manual" rather than "compiler_streak".
+ // Both are valid outcomes of the resolution path.
+ assert.ok(
+ records1b[0].trigger_reason === "compiler_streak" || records1b[0].trigger_reason === "manual",
+ "trigger_reason should be compiler_streak or manual, got: " + records1b[0].trigger_reason,
+ );
+ assert.match(records1b[0].chosen_completion, /println!\('hello'\)/);
+
+ console.log(" scenario 1b: mid-stream guard handled cleanly; DPO pair written to " + jsonlPath1b);
+ } finally {
+ if (cwd1b) {
+ fs.rmSync(cwd1b, { recursive: true, force: true });
+ }
+ guardMock.server.close();
+ process.env.VERIFIER_BASE_URL = savedBaseUrl;
+ }
 
  // -----------------------------------------------------------------------
  // 2. Resolution gate: clean `ls` does NOT resolve; clean build does
