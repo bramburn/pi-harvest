@@ -30,16 +30,28 @@ export interface SteeringContext {
  failedCommand?: string;
  /** Optional alert-type sub-label, e.g. "SEMANTIC REVIEW". */
  subLabel?: string;
+ /** Lane that authored the audit; selects the [STEER:<PROVIDER>] tag. */
+ lane?: SteerLane;
 }
 
 /**
  * Resolve the Tier-3 steer provider tag from the environment.
- * VERIFIER_PROVIDER selects the commander (default k3, "deepseek" is
- * the documented fallback); the value is uppercased and sanitized so
- * the tag stays a single greppable token.
+ * VERIFIER_PROVIDER selects the commander for the verifier lane
+ * (default k3, "deepseek" is the documented fallback); the value is
+ * uppercased and sanitized so the tag stays a single greppable token.
+ * Sub-lanes (distiller / reviewer / opinion) use HARVEST_<LANE>_PROVIDER
+ * and fall back to the verifier tag until they get their own
+ * /harvest-settings pick.
  */
-export function steerProviderTag(): string {
- const raw = (process.env.VERIFIER_PROVIDER ?? "k3").trim().toUpperCase();
+export type SteerLane = "verifier" | "distiller" | "reviewer" | "opinion";
+
+export function steerProviderTag(lane: SteerLane = "verifier"): string {
+ const envKey = lane === "verifier" ? "VERIFIER_PROVIDER" : "HARVEST_" + lane.toUpperCase() + "_PROVIDER";
+ const raw = (
+  process.env[envKey] ??
+  (lane !== "verifier" ? process.env.VERIFIER_PROVIDER : undefined) ??
+  "k3"
+ ).trim().toUpperCase();
  const sanitized = raw.replace(/[^A-Z0-9_-]/g, "");
  return sanitized.length > 0 ? sanitized : "K3";
 }
@@ -50,9 +62,9 @@ export function steerProviderTag(): string {
  * [STEER:K3][SEMANTIC REVIEW]. Downstream slicers classify any message
  * starting with "[STEER:" as Tier 3 (supervisor), never a user prompt.
  */
-export function steerPrefix(subLabel?: string): string {
+export function steerPrefix(subLabel?: string, lane: SteerLane = "verifier"): string {
  const sub = subLabel?.trim();
- return "[STEER:" + steerProviderTag() + "]" + (sub ? "[" + sub + "]" : "");
+ return "[STEER:" + steerProviderTag(lane) + "]" + (sub ? "[" + sub + "]" : "");
 }
 
 /**
@@ -127,7 +139,7 @@ export interface SpliceHost {
  */
 export function buildSteeringBody(audit: VerifierAudit, slice: NeatSlice, steerCtx?: SteeringContext): string {
  const lines: string[] = [];
- lines.push(steerPrefix(steerCtx?.subLabel));
+ lines.push(steerPrefix(steerCtx?.subLabel, steerCtx?.lane));
  lines.push("Subtask: " + audit.inferred_subtask);
  if (audit.divergence_detected) {
  lines.push("Flaw: " + audit.flaw_category + " — " + audit.root_cause);

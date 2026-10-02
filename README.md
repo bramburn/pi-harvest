@@ -49,6 +49,19 @@ Multi-line telemetry dump:
 
 Forces a manual audit immediately, ignoring streak and turn-interval thresholds. Manual audits are written with `trigger_reason: "manual"`.
 
+### `/harvest-settings`
+
+Lane model selection menu (Phase 9). Pick the verifier / distiller / reviewer / opinion models from pi's own catalogue — each entry opens the same typeahead-searchable picker as pi's built-in `/model` (fuzzy filter across provider, model id, and name), built from every provider and model you already configured via `/login` or `models.json`. After a pick the menu reopens, so several lanes can be configured in one pass; choose **Done** (or press Esc) to exit.
+
+- `/harvest-settings` — the looping menu.
+- `/harvest-settings verifier` / `distiller` / `reviewer` / `opinion` — jump straight to the picker for one lane.
+- `/harvest-settings status` — stored selections + effective env (keys redacted).
+- `/harvest-settings clear [lane]` — drop stored selection(s); env config takes over again.
+
+Picks are stored per project in `.pi/harvest/settings.json` as `{ provider, modelId }` (no secrets — API keys and base URLs are resolved through pi's ModelRegistry at apply time) and translated into the lane env vars. The verifier lane keeps the historical `VERIFIER_*` names (pi-audit-gap and friends fall back to them as the shared supervisor endpoint); the distiller / reviewer / opinion lanes use `HARVEST_<LANE>_*` and **every one of those vars falls back to the verifier lane's**, so unpicked lanes keep riding the verifier model exactly as before. `[STEER:<provider>]` tags follow the lane that authored the steer (`HARVEST_<LANE>_PROVIDER`, falling back to `VERIFIER_PROVIDER`). Native `anthropic-messages` models are excluded from the picker — pi-harvest only speaks OpenAI-compatible chat/completions — unless they are served from an `openrouter.ai` base.
+
+Outside the TUI (RPC/JSON/print modes) the picker falls back to pi's flat `select` dialog. Stored selections are re-applied on every `session_start` so restarts and `/reload` pick them up.
+
 ### `/harvest export dpo`
 
 Streams every `.pi/harvest/trajectories*.jsonl` file (line-by-line, no full-file loads) and writes a HuggingFace conversational DPO file to:
@@ -98,11 +111,18 @@ idle ──(threshold trips)──▶ auditing ──(success)──▶ awaiting
 
 | Variable | Required | Example |
 |----------|----------|---------|
-| `VERIFIER_BASE_URL` | yes | `https://api.moonshot.cn/v1` |
-| `VERIFIER_API_KEY` | yes | `sk-...` |
-| `VERIFIER_MODEL` | yes | `kimi-k2-0711-preview`, `deepseek-chat`, etc. |
+| `VERIFIER_BASE_URL` | yes* | `https://api.moonshot.cn/v1` |
+| `VERIFIER_API_KEY` | yes* | `sk-...` |
+| `VERIFIER_MODEL` | yes* | `kimi-k2-0711-preview`, `deepseek-chat`, etc. |
+| `VERIFIER_PROVIDER` | no | `[STEER:<provider>]` tag for verifier-lane steers; default `K3` |
+| `HARVEST_DISTILLER_BASE_URL` / `HARVEST_DISTILLER_API_KEY` / `HARVEST_DISTILLER_MODEL` | no | distiller lane; **every var falls back to the verifier lane's** |
+| `HARVEST_REVIEWER_BASE_URL` / `HARVEST_REVIEWER_API_KEY` / `HARVEST_REVIEWER_MODEL` | no | reviewer lane; falls back to the verifier lane |
+| `HARVEST_OPINION_BASE_URL` / `HARVEST_OPINION_API_KEY` / `HARVEST_OPINION_MODEL` | no | opinion lane; falls back to the verifier lane |
+| `HARVEST_<LANE>_PROVIDER` | no | `[STEER:<provider>]` tag for that lane's steers; falls back to `VERIFIER_PROVIDER` |
 | `HARVEST_TIMEOUT_MS` | no | `30000` (per-attempt) |
 | `HARVEST_MAX_RETRIES` | no | `2` (backoff `1s → 2s`) |
+
+\* Only until you pick a model with `/harvest-settings` — a stored selection overrides env for its lane, and `clear` restores it. All lanes speak OpenAI-compatible chat/completions.
 
 **Schema** (fence stripping automatic):
 
@@ -217,14 +237,18 @@ src/
 ├── sink.ts         currentSinkPath() + listSinkFiles() + buildTrajectoryRecord() + writeTrajectoryRecord() + countRecords() + getSinkStats()
 ├── exporter.ts     (NEW) mapRecordToHfDpo() + exportToHuggingFaceDPO() — streaming line-by-line converter
 ├── telemetry.ts    (NEW) aggregateTelemetry() + formatTelemetryForNotify() — streaming top-N flaw counts
-└── index.ts        Extension entry — hooks, state machine, /harvest command, TUI widget
+├── model-picker.ts (NEW) searchable model picker over pi's catalogue (same UX as /model)
+├── settings.ts     (NEW) /harvest-settings persistence + lane env application
+└── index.ts        Extension entry — hooks, state machine, /harvest + /harvest-settings commands, TUI widget
 test/
 ├── slice.test.ts       16 tests
 ├── workspace.test.ts   17 tests (incl. git-diff failure modes)
 ├── sink.test.ts        22 tests (incl. Phase 4 rotation + back-compat)
 ├── verifier.test.ts    11 tests
 ├── exporter.test.ts    7 tests
-└── telemetry.test.ts   7 tests
+├── telemetry.test.ts   7 tests
+├── splice.test.ts      steer/splice tests (incl. per-lane provider tags)
+└── settings.test.ts    /harvest-settings persistence, env apply/restore, lane fallbacks, picker
 tests/
 └── smoke.js        Integration test — mocked pi runtime + mocked verifier HTTP, exercises audit/splice/resolve and /harvest status + /harvest audit + /harvest export dpo
 ```

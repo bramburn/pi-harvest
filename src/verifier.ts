@@ -12,6 +12,21 @@ import type { NeatSlice, VerifierAudit, ActiveFile } from "./types.js";
 import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
 import { buildVerifierPayload } from "./slice.js";
 
+/**
+ * Independent LLM lanes. Every lane speaks OpenAI-compatible
+ * chat/completions; each sub-lane's env vars fall back to the verifier
+ * lane's, so without a /harvest-settings pick all lanes ride the
+ * verifier model exactly as before:
+ *
+ * - verifier (parent): compile-failure auditor. Env vars keep the
+ *   historical VERIFIER_* names (pi-audit-gap and friends fall back to
+ *   them as the shared supervisor endpoint).
+ * - distiller: Phase 5 hindsight relabeling of thrashing streaks.
+ * - reviewer:  Phase 6 semantic review (/harvest review <feedback>).
+ * - opinion:   Phase 8 architectural opinion (/harvest opinion [query]).
+ */
+export type Lane = "verifier" | "distiller" | "reviewer" | "opinion";
+
 const REQUIRED_FIELDS: (keyof VerifierAudit)[] = [
  "inferred_subtask",
  "divergence_detected",
@@ -43,10 +58,27 @@ const SYSTEM_PROMPT = [
  "Return JSON only. Do not wrap it in markdown fences. Do not add prose.",
 ].join("\n");
 
-function readEnv(): { baseUrl: string; apiKey: string; model: string; timeoutMs: number; retries: number } {
- const baseUrl = process.env.VERIFIER_BASE_URL?.replace(/\/+$/, "") ?? "";
- const apiKey = process.env.VERIFIER_API_KEY ?? "";
- const model = process.env.VERIFIER_MODEL ?? "";
+function laneEnvPrefix(lane: Lane): string {
+ return lane === "verifier" ? "VERIFIER" : "HARVEST_" + lane.toUpperCase();
+}
+
+export function readEnv(lane: Lane = "verifier"): { baseUrl: string; apiKey: string; model: string; timeoutMs: number; retries: number } {
+ const prefix = laneEnvPrefix(lane);
+ // Sub-lanes fall back to the verifier lane's env vars so a single
+ // supervisor endpoint serves every lane during bring-up.
+ const fallback = lane !== "verifier";
+ const baseUrl =
+  process.env[prefix + "_BASE_URL"]?.replace(/\/+$/, "") ??
+  (fallback ? process.env.VERIFIER_BASE_URL?.replace(/\/+$/, "") : undefined) ??
+  "";
+ const apiKey =
+  process.env[prefix + "_API_KEY"] ??
+  (fallback ? process.env.VERIFIER_API_KEY : undefined) ??
+  "";
+ const model =
+  process.env[prefix + "_MODEL"] ??
+  (fallback ? process.env.VERIFIER_MODEL : undefined) ??
+  "";
  const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? "300000");
  const retries = Number(process.env.HARVEST_MAX_RETRIES ?? "2");
  // Missing required env vars throw VerifierConfigError (not a bare
@@ -54,9 +86,11 @@ function readEnv(): { baseUrl: string; apiKey: string; model: string; timeoutMs:
  // "the verifier isn't configured yet" and surface a helpful hint
  // instead of a misleading "after retries" error message.
  const missing: string[] = [];
- if (!baseUrl) missing.push("VERIFIER_BASE_URL");
- if (!apiKey) missing.push("VERIFIER_API_KEY");
- if (!model) missing.push("VERIFIER_MODEL");
+ // For sub-lanes name both variables: the lane-specific one and the
+ // verifier fallback it would have inherited.
+ if (!baseUrl) missing.push(fallback ? prefix + "_BASE_URL (or VERIFIER_BASE_URL)" : prefix + "_BASE_URL");
+ if (!apiKey) missing.push(fallback ? prefix + "_API_KEY (or VERIFIER_API_KEY)" : prefix + "_API_KEY");
+ if (!model) missing.push(fallback ? prefix + "_MODEL (or VERIFIER_MODEL)" : prefix + "_MODEL");
  if (missing.length > 0) throw new VerifierConfigError(missing);
  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
  throw new VerifierConfigError(["HARVEST_TIMEOUT_MS (must be a positive number)"]);
@@ -417,7 +451,7 @@ export async function invokeDistiller(opts: {
  slice: NeatSlice;
  activeFiles: ActiveFile[];
 }): Promise<DistillerResponse> {
- const env = readEnv();
+ const env = readEnv("distiller");
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -443,7 +477,7 @@ export async function invokeDistiller(opts: {
  * with exponential backoff on retryable failures.
  */
 export async function invokeVerifier(slice: NeatSlice): Promise<VerifierAudit> {
- const env = readEnv();
+ const env = readEnv("verifier");
  const opts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -617,7 +651,7 @@ export async function invokeReviewer(opts: {
  activeFiles: ActiveFile[];
  humanFeedback: string;
 }): Promise<ReviewerResponse> {
- const env = readEnv();
+ const env = readEnv("reviewer");
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -793,7 +827,7 @@ export async function invokeOpinion(opts: {
  activeFiles: ActiveFile[];
  optionalQuery: string;
 }): Promise<OpinionResponse> {
- const env = readEnv();
+ const env = readEnv("opinion");
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;

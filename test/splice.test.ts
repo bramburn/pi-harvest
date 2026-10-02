@@ -187,6 +187,25 @@ test("steerPrefix: defaults to K3, honors VERIFIER_PROVIDER, carries sub-labels"
  }
 });
 
+test("steerPrefix: sub-lanes use HARVEST_<LANE>_PROVIDER with verifier fallback", async () => {
+ const { steerPrefix } = await import("../dist/splice.js");
+ delete process.env.VERIFIER_PROVIDER;
+ delete process.env.HARVEST_REVIEWER_PROVIDER;
+ delete process.env.HARVEST_DISTILLER_PROVIDER;
+ // No picks anywhere: sub-lanes fall back to the verifier default.
+ assert.equal(steerPrefix("SEMANTIC REVIEW", "reviewer"), "[STEER:K3][SEMANTIC REVIEW]");
+ // Verifier provider tag propagates to sub-lanes.
+ process.env.VERIFIER_PROVIDER = "deepseek";
+ assert.equal(steerPrefix("SEMANTIC REVIEW", "reviewer"), "[STEER:DEEPSEEK][SEMANTIC REVIEW]");
+ assert.equal(steerPrefix("THRASHING", "distiller"), "[STEER:DEEPSEEK][THRASHING]");
+ // A sub-lane pick overrides its own tag only.
+ process.env.HARVEST_REVIEWER_PROVIDER = "claude opus 5.5!";
+ assert.equal(steerPrefix("SEMANTIC REVIEW", "reviewer"), "[STEER:CLAUDEOPUS55][SEMANTIC REVIEW]");
+ assert.equal(steerPrefix("THRASHING", "distiller"), "[STEER:DEEPSEEK][THRASHING]");
+ delete process.env.VERIFIER_PROVIDER;
+ delete process.env.HARVEST_REVIEWER_PROVIDER;
+});
+
 test("performSplice: steering body renders provider tag and sub-label", async () => {
  process.env.VERIFIER_PROVIDER = "deepseek";
  try {

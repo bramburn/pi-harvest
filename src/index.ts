@@ -24,6 +24,14 @@
  * 1-2 turn trajectories into sft_golden_YYYY_MM.jsonl, exportable
  * to HF SFTTrainer shape with /harvest export sft.
  *
+ * Phase 9: /harvest-settings lane model selection. A looping settings
+ * menu picks the verifier / distiller / reviewer / opinion models from
+ * pi's own catalogue (the same searchable picker UX as /model), stores
+ * { provider, modelId } per project in .pi/harvest/settings.json, and
+ * translates picks into the lane env vars (sub-lanes fall back to the
+ * verifier lane, so unpicked lanes behave exactly as before).
+ * [STEER:<provider>] tags follow the lane that authored the steer.
+ *
  * State machine (formalised):
  *   idle  --(threshold trips)-->  auditing
  *   auditing --(success)-->  awaiting_resolution
@@ -69,6 +77,16 @@ import type {
  VerifierAudit,
 } from "./types.js";
 import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
+import { pickLaneModel, type PickerComponent, type PickerTheme } from "./model-picker.js";
+import {
+ applyLaneSelections,
+ laneEnvPrefix,
+ loadSettings,
+ setLaneSelection,
+ type LaneApplyResult,
+ type ModelRegistryLike,
+} from "./settings.js";
+import type { Lane } from "./verifier.js";
 
 // ---------------------------------------------------------------------------
 // Minimal runtime interfaces (declared locally so the package builds
@@ -78,12 +96,28 @@ import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
 interface UiHelpers {
  setStatus?(key: string, content: unknown): void;
  notify?(message: string, level?: string): void;
+ select?(title: string, options: string[]): Promise<string | undefined>;
+ custom?<T>(
+  factory: (
+   tui: unknown,
+   theme: PickerTheme,
+   keybindings: unknown,
+   done: (result: T) => void,
+  ) => PickerComponent | Promise<PickerComponent>,
+  options?: unknown,
+ ): Promise<T>;
 }
 
 interface PiContext {
  ui: UiHelpers;
  cwd: string;
  model?: { id?: string; name?: string; provider?: string } | undefined;
+ /** pi's ModelRegistry — powers the /harvest-settings model picker. */
+ modelRegistry?: unknown;
+ /** Session mode: "tui" gets the searchable picker, others fall back. */
+ mode?: string;
+ /** False in headless sessions (RPC/JSON/print). */
+ hasUI?: boolean;
  sessionManager: {
  getBranch(): SessionEntry[];
  getSessionId(): string;
@@ -311,6 +345,152 @@ export default function (pi: ExtensionAPI): void {
  function workerModelId(ctx: PiContext): string {
  if (!ctx.model) return "unknown";
  return (ctx.model.provider ?? "") + ":" + (ctx.model.id ?? ctx.model.name ?? "unknown");
+ }
+
+ // -------------------------------------------------------------------------
+ // /harvest-settings — lane model selection from pi's catalogue
+ // -------------------------------------------------------------------------
+
+ /**
+ * Apply stored selections to the lane env vars. Called on session_start
+ * (verbose: report applied lanes) and after picker actions (the caller
+ * reports the specific lane itself).
+ */
+ async function applyStoredSelections(ctx: PiContext, verbose: boolean): Promise<LaneApplyResult[]> {
+ const results = await applyLaneSelections(ctx.cwd, ctx.modelRegistry as ModelRegistryLike | undefined);
+ if (verbose) {
+  for (const r of results) {
+   if (r.status === "applied") {
+    notify(ctx, r.lane + " lane model: " + r.detail + " (from /harvest-settings)", "info");
+   } else if (r.status === "missing" || r.status === "failed") {
+    notify(ctx, r.lane + " lane selection not applied: " + r.detail, "warning");
+   }
+  }
+ }
+ return results;
+ }
+
+ const LANE_LABELS: Record<Lane, string> = {
+ verifier: "Verifier",
+ distiller: "Distiller",
+ reviewer: "Reviewer",
+ opinion: "Opinion",
+ };
+
+ async function selectLaneModel(ctx: PiContext, lane: Lane): Promise<void> {
+ const choice = await pickLaneModel(
+  { mode: ctx.mode ?? "tui", ui: ctx.ui as never },
+  ctx.modelRegistry as never,
+  lane,
+  { openAiCompatibleOnly: true },
+ );
+ if (!choice) {
+  notify(ctx, "No model picked — " + lane + " lane unchanged", "info");
+  return;
+ }
+ setLaneSelection(ctx.cwd, lane, choice);
+ const results = await applyStoredSelections(ctx, false);
+ const mine = results.find((r) => r.lane === lane);
+ if (mine?.status === "applied") {
+  notify(
+   ctx,
+   LANE_LABELS[lane] + " lane → " + choice.provider + "/" + choice.modelId +
+    " (stored in .pi/harvest/settings.json)",
+   "info",
+  );
+ } else {
+  notify(
+   ctx,
+   "Stored " + choice.provider + "/" + choice.modelId + " but could not apply it: " + (mine?.detail ?? "unknown") +
+    " — check /login or models.json for this provider",
+   "warning",
+  );
+ }
+ }
+
+ async function clearLaneSelection(ctx: PiContext, lane: Lane | undefined): Promise<void> {
+ const lanes: Lane[] = lane ? [lane] : ["verifier", "distiller", "reviewer", "opinion"];
+ for (const l of lanes) {
+  setLaneSelection(ctx.cwd, l, undefined);
+ }
+ await applyStoredSelections(ctx, false);
+ notify(
+  ctx,
+  "Cleared " + (lane ?? "all lanes") + " model selection — env config back in effect",
+  "info",
+ );
+ }
+
+ function redact(value: string | undefined): string {
+ if (!value) return "<unset>";
+ if (value.length <= 10) return "••••••••";
+ return value.slice(0, 7) + "…";
+ }
+
+ function showSettingsStatus(ctx: PiContext): void {
+ const stored = loadSettings(ctx.cwd);
+ const lines: string[] = ["Harvest lane model settings (.pi/harvest/settings.json):"];
+ for (const lane of ["verifier", "distiller", "reviewer", "opinion"] as const) {
+  const sel = stored?.[lane];
+  const prefix = laneEnvPrefix(lane);
+  // Sub-lanes ride the verifier lane when they have no stored pick.
+  const effectiveModel =
+   process.env[prefix + "_MODEL"] ??
+   (lane !== "verifier" ? process.env.VERIFIER_MODEL : undefined) ??
+   "<unset>";
+  const effectiveBase =
+   process.env[prefix + "_BASE_URL"] ??
+   (lane !== "verifier" ? process.env.VERIFIER_BASE_URL : undefined) ??
+   "<unset>";
+  lines.push(
+   " " + lane + ": " +
+    (sel ? sel.provider + "/" + sel.modelId + " (stored)" : "no stored selection") +
+    " | effective: " + effectiveModel + " @ " + effectiveBase +
+    " key:" + redact(process.env[prefix + "_API_KEY"]),
+  );
+ }
+ lines.push("All lanes speak OpenAI-compatible chat/completions. Change with: /harvest-settings");
+ ctx.ui?.notify?.(lines.join("\n"), "info");
+ }
+
+ async function settingsMenu(ctx: PiContext): Promise<void> {
+ if (!ctx.hasUI || typeof ctx.ui?.select !== "function") {
+  notify(ctx, "Usage: /harvest-settings verifier | distiller | reviewer | opinion | status | clear [lane]", "warn");
+  return;
+ }
+ // Loop: after each action (e.g. a model pick) the menu reopens, so
+ // several lanes can be configured in one pass. "Done" or Esc exits.
+ for (;;) {
+  const choice = await ctx.ui.select(
+   "Harvest settings",
+   [
+    "Select verifier model (error auditor)",
+    "Select distiller model (thrash compression)",
+    "Select reviewer model (semantic review)",
+    "Select opinion model (architectural opinion)",
+    "Show current settings",
+    "Clear verifier model selection",
+    "Clear distiller model selection",
+    "Clear reviewer model selection",
+    "Clear opinion model selection",
+    "Done",
+   ],
+  );
+  if (!choice || choice === "Done") return;
+  try {
+   if (choice === "Select verifier model (error auditor)") await selectLaneModel(ctx, "verifier");
+   else if (choice === "Select distiller model (thrash compression)") await selectLaneModel(ctx, "distiller");
+   else if (choice === "Select reviewer model (semantic review)") await selectLaneModel(ctx, "reviewer");
+   else if (choice === "Select opinion model (architectural opinion)") await selectLaneModel(ctx, "opinion");
+   else if (choice === "Show current settings") showSettingsStatus(ctx);
+   else if (choice === "Clear verifier model selection") await clearLaneSelection(ctx, "verifier");
+   else if (choice === "Clear distiller model selection") await clearLaneSelection(ctx, "distiller");
+   else if (choice === "Clear reviewer model selection") await clearLaneSelection(ctx, "reviewer");
+   else if (choice === "Clear opinion model selection") await clearLaneSelection(ctx, "opinion");
+  } catch (err) {
+   notify(ctx, "settings error: " + ((err as Error)?.message ?? String(err)), "warn");
+  }
+ }
  }
 
  /**
@@ -613,6 +793,40 @@ export default function (pi: ExtensionAPI): void {
  // Slash command: /harvest status | /harvest audit | /harvest export dpo
  // -------------------------------------------------------------------------
 
+ // -------------------------------------------------------------------------
+ // /harvest-settings — lane model selection menu
+ // -------------------------------------------------------------------------
+
+ pi.registerCommand("harvest-settings", {
+ description: "Lane model selection menu. Subcommands: verifier | distiller | reviewer | opinion | status | clear [lane]",
+ handler: async (args, ctx) => {
+ const c = ctx as PiContext;
+ try {
+  const [sub, sub2] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  if (sub === "verifier" || sub === "distiller" || sub === "reviewer" || sub === "opinion") {
+   await selectLaneModel(c, sub);
+  } else if (sub === "status") {
+   showSettingsStatus(c);
+  } else if (sub === "clear") {
+   await clearLaneSelection(c, sub2 === "verifier" || sub2 === "distiller" || sub2 === "reviewer" || sub2 === "opinion" ? sub2 : undefined);
+  } else {
+   await settingsMenu(c);
+  }
+ } catch (err) {
+  notify(c, "settings error: " + ((err as Error)?.message ?? String(err)), "warn");
+ }
+ },
+ });
+
+ // Apply stored model selections on every session start so restarts and
+ // /reload pick them up without touching env vars by hand.
+ pi.on("session_start", (_event, ctx) => {
+ const c = ctx as PiContext;
+ applyStoredSelections(c, true).catch((err: unknown) => {
+  notify(c, "settings apply failed: " + ((err as Error)?.message ?? String(err)), "warn");
+ });
+ });
+
  pi.registerCommand("harvest", {
  description: "pi-harvest controls. Subcommands: status | audit | retry | rewind | review <feedback> | opinion [query] | export [dpo|sft]",
  handler: async (args, ctx) => {
@@ -763,7 +977,13 @@ export default function (pi: ExtensionAPI): void {
  "Verifier: " +
  (process.env.VERIFIER_BASE_URL || "<unset>") +
  " model=" +
- (process.env.VERIFIER_MODEL || "<unset>");
+ (process.env.VERIFIER_MODEL || "<unset>") +
+ " | distiller=" +
+ (process.env.HARVEST_DISTILLER_MODEL ?? process.env.VERIFIER_MODEL ?? "<unset>") +
+ " reviewer=" +
+ (process.env.HARVEST_REVIEWER_MODEL ?? process.env.VERIFIER_MODEL ?? "<unset>") +
+ " opinion=" +
+ (process.env.HARVEST_OPINION_MODEL ?? process.env.VERIFIER_MODEL ?? "<unset>");
  const line3 =
  "Sink: " +
  stats.path +
@@ -1073,7 +1293,7 @@ export default function (pi: ExtensionAPI): void {
  }
 
  const steeringBody =
- steerPrefix("SEMANTIC REVIEW") + "\n" +
+ steerPrefix("SEMANTIC REVIEW", "reviewer") + "\n" +
  "Human Feedback: " + humanFeedback + "\n" +
  "Diagnosis: " + review.diagnosis + "\n" +
  "Action Required: " + review.steering_instructions +
@@ -1193,7 +1413,7 @@ export default function (pi: ExtensionAPI): void {
  // NO navigateTree here — the pre-refactor working code is the rejected
  // baseline. We only inject the forward-looking advisory steer.
  const steeringBody =
- steerPrefix("ARCHITECTURAL OPINION") + "\n" +
+ steerPrefix("ARCHITECTURAL OPINION", "opinion") + "\n" +
  (optionalQuery ? "Query: " + optionalQuery + "\n" : "") +
  "Analysis: " + opinion.opinion_summary + "\n" +
  "Action Required: " + opinion.refactor_instructions +
@@ -1276,7 +1496,7 @@ export default function (pi: ExtensionAPI): void {
  // Inject it as a Tier-3 steer so the worker stops thrashing instead of
  // only feeding the sink. (Budget rule: still exactly one verifier call.)
  const steerBody =
-  steerPrefix("THRASHING") + "\n" +
+  steerPrefix("THRASHING", "distiller") + "\n" +
   "Subtask: " + (slice.inceptionPrompt || "(current task)") + "\n" +
   "Flaw: thrashing — " + thrashingStreak + " tool calls with repeated rework on the same file(s)\n" +
   "Optimal path (supervisor-distilled single-turn solution):\n" +
