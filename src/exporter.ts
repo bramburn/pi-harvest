@@ -1,7 +1,7 @@
 /**
  * Native HuggingFace DPO dataset exporter (Phase 4).
  *
- * Reads all `.pi/harvest/trajectories*.jsonl` files via streaming
+ * Reads all `<harvestRoot>/trajectories*.jsonl` files via streaming
  * (line-by-line, never loads the full file into RAM), maps each record
  * into the HF conversational DPO format expected by `trl.DPOTrainer`:
  *
@@ -17,7 +17,7 @@
  * 2. the clamped git_diff_summary (or a no-diff placeholder)
  * 3. a per-file context dump (path + clamped content) for each active file
  *
- * Output: `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`.
+ * Output: `<harvestRoot>/exports/dpo_dataset_YYYY_MM_DD.jsonl`.
  */
 
 import { appendFileSync, createReadStream, mkdirSync, existsSync, writeFileSync } from "node:fs";
@@ -25,6 +25,7 @@ import { join, basename } from "node:path";
 import { createInterface } from "node:readline";
 
 import { listSinkFiles, listSftFiles } from "./sink.js";
+import { resolveHarvestRoot, ensureHarvestRoot } from "./paths.js";
 
 export interface ExportOptions {
  cwd: string;
@@ -111,7 +112,7 @@ export function exportFilename(now: Date = new Date()): string {
  */
 export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<ExportResult> {
  const now = opts.now ?? new Date();
- const dir = join(opts.cwd, ".pi", "harvest", "exports");
+ const dir = join(ensureHarvestRoot(), "exports");
  mkdirSync(dir, { recursive: true });
 
  const outPath = join(dir, exportFilename(now));
@@ -212,7 +213,7 @@ export function sftExportFilename(now: Date = new Date()): string {
  */
 export async function exportToHuggingFaceSFT(opts: ExportOptions): Promise<ExportResult> {
  const now = opts.now ?? new Date();
- const dir = join(opts.cwd, ".pi", "harvest", "exports");
+ const dir = join(ensureHarvestRoot(), "exports");
  mkdirSync(dir, { recursive: true });
 
  const outPath = join(dir, sftExportFilename(now));

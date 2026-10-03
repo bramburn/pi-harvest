@@ -55,6 +55,7 @@
  */
 
 import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
+import { migrateLegacyHarvest } from "./paths.js";
 import { extractNeatSlice, messageToText, extractToolResultText, enforcePayloadSize } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
 import { performSplice, buildFilesLine, steerPrefix } from "./splice.js";
@@ -212,6 +213,17 @@ interface LastError {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
+ // One-time migration: copy any legacy <cwd>/.pi/harvest/*.jsonl files
+ // into the user-home harvest root (see ./paths.js). Idempotent — files
+ // already present at the destination are skipped, originals are never
+ // deleted. Runs silently at activation because ExtensionAPI has no
+ // `ui` handle; the first event handler's ctx.ui could surface it later.
+ try {
+ migrateLegacyHarvest(process.cwd());
+ } catch {
+ // Never block extension startup on migration errors.
+ }
+
  let turnCounter = 0;
  let compilerFailStreak = 0;
  let harvestCount = 0;

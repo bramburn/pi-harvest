@@ -12,7 +12,11 @@ import * as exporter from "../dist/exporter.js";
 import * as sink from "../dist/sink.js";
 
 async function tmpCwd() {
- return await mkdtemp(join(tmpdir(), "pi-harvest-exporter-"));
+ const dir = await mkdtemp(join(tmpdir(), "pi-harvest-exporter-"));
+ // Pin the harvest root under the temp dir so writes land inside it
+ // and the test's rm(cwd) cleanup reclaims them. See ./paths.js.
+ process.env.PI_HARVEST_ROOT = join(dir, ".pi", "harvest");
+ return dir;
 }
 
 test("mapRecordToHfDpo: maps a complete record into HF conversational format", () => {

@@ -2,23 +2,32 @@
  * DPO / SFT data sink (Phase 4).
  *
  * Writes one HarvestedTrajectoryRecord per resolved episode to a
- * date-stamped file `<cwd>/.pi/harvest/trajectories_YYYY_MM.jsonl`
- * using `appendFileSync` for line-atomic POSIX writes. On Windows the
- * kernel still flushes the line before returning; concurrent writers
- * risk interleaving but each line is a self-contained JSON object so
+ * date-stamped file `<harvestRoot>/trajectories_YYYY_MM.jsonl` using
+ * `appendFileSync` for line-atomic POSIX writes. On Windows the kernel
+ * still flushes the line before returning; concurrent writers risk
+ * interleaving but each line is a self-contained JSON object so
  * consumers re-parse line-by-line.
  *
+ * Path resolution: as of the user-home relocation, the harvest root is
+ * resolved via `resolveHarvestRoot()` in `./paths.js` — by default
+ * `%USERPROFILE%/.pi/harvest` on Windows and `$HOME/.pi/harvest`
+ * elsewhere. Tests pin the root via the `PI_HARVEST_ROOT` env var.
+ * The `cwd` parameters on the exported helpers are retained for API
+ * compatibility with existing callers and unit tests but no longer
+ * influence the on-disk location.
+ *
  * Phase 4 additions:
- * - Rotated filenames by year+month. `currentSinkPath(cwd)` resolves
+ * - Rotated filenames by year+month. `currentSinkPath()` resolves
  * the active month's file. Old records in `trajectories.jsonl` (Phase 3)
  * are still discovered by `listSinkFiles()` so the exporter can read them.
  * - Streaming line counters via `countLines(path)` so large files don't
  * blow up RAM.
- * - `listSinkFiles(cwd)` returns all `trajectories*.jsonl` paths sorted
+ * - `listSinkFiles()` returns all `trajectories*.jsonl` paths sorted
  * oldest-first — the canonical input for the exporter.
  */
 
 import { appendFileSync, mkdirSync, statSync, existsSync, createReadStream } from "node:fs";
+import { resolveHarvestRoot, ensureHarvestRoot } from "./paths.js";
 import { join, basename } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -74,15 +83,15 @@ export function currentSftSinkFilename(now: Date = new Date()): string {
 /**
  * Resolve the absolute path to the active SFT Golden sink file.
  */
-export function currentSftSinkPath(cwd: string, now: Date = new Date()): string {
- return join(cwd, ".pi", "harvest", currentSftSinkFilename(now));
+export function currentSftSinkPath(_cwd?: string, now: Date = new Date()): string {
+ return join(resolveHarvestRoot(), currentSftSinkFilename(now));
 }
 
 /**
  * Discover all SFT Golden sink files.
  */
-export function listSftFiles(cwd: string): string[] {
- const dir = join(cwd, ".pi", "harvest");
+export function listSftFiles(_cwd?: string): string[] {
+ const dir = ensureHarvestRoot();
  if (!existsSync(dir)) return [];
  const { readdirSync } = require("node:fs") as typeof import("node:fs");
  const entries = readdirSync(dir);
@@ -96,10 +105,10 @@ export function listSftFiles(cwd: string): string[] {
  * Append one GoldenSFTRecord as a JSONL line to the active month's
  * SFT Golden sink. Creates the directory if missing.
  */
-export function appendGoldenSFT(cwd: string, record: GoldenSFTRecord, now: Date = new Date()): SinkResult {
- const dir = join(cwd, ".pi", "harvest");
+export function appendGoldenSFT(_cwd: string | undefined, record: GoldenSFTRecord, now: Date = new Date()): SinkResult {
+ const dir = ensureHarvestRoot();
  mkdirSync(dir, { recursive: true });
- const filePath = currentSftSinkPath(cwd, now);
+ const filePath = currentSftSinkPath(undefined, now);
  const line = JSON.stringify(record) + "\n";
  appendFileSync(filePath, line, { encoding: "utf8" });
  return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };
@@ -108,8 +117,8 @@ export function appendGoldenSFT(cwd: string, record: GoldenSFTRecord, now: Date 
 /**
  * Sync count of SFT Golden records in the current month's sink.
  */
-export function countSftRecords(cwd: string, now: Date = new Date()): number {
- const filePath = currentSftSinkPath(cwd, now);
+export function countSftRecords(_cwd?: string, now: Date = new Date()): number {
+ const filePath = currentSftSinkPath(undefined, now);
  if (!existsSync(filePath)) return 0;
  const buf = (require("node:fs") as typeof import("node:fs")).readFileSync(filePath, "utf8") as string;
  if (!buf) return 0;
@@ -124,16 +133,16 @@ export function countSftRecords(cwd: string, now: Date = new Date()): number {
 /**
  * Resolve the absolute path to the active sink file.
  */
-export function currentSinkPath(cwd: string, now: Date = new Date()): string {
- return join(cwd, ".pi", "harvest", currentSinkFilename(now));
+export function currentSinkPath(_cwd?: string, now: Date = new Date()): string {
+ return join(resolveHarvestRoot(), currentSinkFilename(now));
 }
 
 /**
  * Discover all sink files (rotated + the v0.3.0 unrotated default)
  * sorted oldest-first by filename so streaming is deterministic.
  */
-export function listSinkFiles(cwd: string): string[] {
- const dir = join(cwd, ".pi", "harvest");
+export function listSinkFiles(_cwd?: string): string[] {
+ const dir = ensureHarvestRoot();
  if (!existsSync(dir)) return [];
  const { readdirSync } = require("node:fs") as typeof import("node:fs");
  const entries = readdirSync(dir);
@@ -192,12 +201,12 @@ export function buildTrajectoryRecord(args: {
  */
 export function writeTrajectoryRecord(
  record: HarvestedTrajectoryRecord,
- cwd: string,
+ _cwd?: string,
  now: Date = new Date(),
 ): SinkResult {
- const dir = join(cwd, ".pi", "harvest");
+ const dir = ensureHarvestRoot();
  mkdirSync(dir, { recursive: true });
- const filePath = currentSinkPath(cwd, now);
+ const filePath = currentSinkPath(undefined, now);
  const line = JSON.stringify(record) + "\n";
  appendFileSync(filePath, line, { encoding: "utf8" });
  return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };
@@ -236,7 +245,7 @@ export function writeDpoEntry(args: {
  humanFeedback: args.humanFeedback ?? null,
  ctx: args.ctx,
  });
- return writeTrajectoryRecord(record, args.ctx.cwd);
+ return writeTrajectoryRecord(record, undefined);
 }
 
 /**
@@ -279,8 +288,8 @@ export async function countRecords(path: string): Promise<number> {
  * MONTH's sink file. Preserves the v0.3.0 API for any external
  * consumers (and the unit tests that import it directly).
  */
-export function countHarvestedRecords(cwd: string, now: Date = new Date()): number {
- const filePath = currentSinkPath(cwd, now);
+export function countHarvestedRecords(_cwd?: string, now: Date = new Date()): number {
+ const filePath = currentSinkPath(undefined, now);
  if (!existsSync(filePath)) return 0;
  const buf = require("node:fs").readFileSync(filePath, "utf8") as string;
  if (!buf) return 0;
@@ -302,8 +311,8 @@ export interface SinkStats {
  sizeBytes: number;
 }
 
-export async function getSinkStats(cwd: string, now: Date = new Date()): Promise<SinkStats> {
- const filePath = currentSinkPath(cwd, now);
+export async function getSinkStats(_cwd?: string, now: Date = new Date()): Promise<SinkStats> {
+ const filePath = currentSinkPath(undefined, now);
  if (!existsSync(filePath)) {
  return { path: filePath, recordCount: 0, sizeBytes: 0 };
  }
@@ -319,6 +328,6 @@ export async function getSinkStats(cwd: string, now: Date = new Date()): Promise
  * Get the basename of the current sink file (e.g. `trajectories_2026_09.jsonl`).
  * Useful for telemetry/status formatting.
  */
-export function activeSinkBasename(cwd: string, now: Date = new Date()): string {
- return basename(currentSinkPath(cwd, now));
+export function activeSinkBasename(_cwd?: string, now: Date = new Date()): string {
+ return basename(currentSinkPath(undefined, now));
 }

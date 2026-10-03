@@ -12,7 +12,11 @@ import * as sink from "../dist/sink.js";
 import type { ActiveFile, HarvestedTrajectoryRecord, NeatSlice, VerifierAudit } from "../dist/types.js";
 
 async function tmpCwd() {
- return await mkdtemp(join(tmpdir(), "pi-harvest-sink-"));
+ const dir = await mkdtemp(join(tmpdir(), "pi-harvest-sink-"));
+ // Pin the harvest root under the temp dir so writes land inside it
+ // and the test's rm(cwd) cleanup reclaims them. See ./paths.js.
+ process.env.PI_HARVEST_ROOT = join(dir, ".pi", "harvest");
+ return dir;
 }
 
 const BASE_AUDIT: VerifierAudit = {
@@ -131,17 +135,19 @@ test("writeTrajectoryRecord: appends to an existing file without clobbering", as
 });
 
 test("countHarvestedRecords: returns 0 for missing file", () => {
- const cwd = join(tmpdir(), "pi-harvest-missing-" + Date.now());
- assert.equal(sink.countHarvestedRecords(cwd), 0);
+ const root = join(tmpdir(), "pi-harvest-missing-" + Date.now());
+ process.env.PI_HARVEST_ROOT = root;
+ assert.equal(sink.countHarvestedRecords(), 0);
 });
 
 test("countHarvestedRecords: counts lines on the current month's file", () => {
- const cwd = join(tmpdir(), "pi-harvest-count-" + Date.now());
- const filePath = sink.currentSinkPath(cwd);
- mkdirSync(join(cwd, ".pi", "harvest"), { recursive: true });
+ const root = join(tmpdir(), "pi-harvest-count-" + Date.now());
+ process.env.PI_HARVEST_ROOT = root;
+ const filePath = sink.currentSinkPath();
+ mkdirSync(root, { recursive: true });
  writeFileSync(filePath, '{"a":1}\n{"a":2}\n{"a":3}\n', "utf8");
- assert.equal(sink.countHarvestedRecords(cwd), 3);
- rmSync(cwd, { recursive: true, force: true });
+ assert.equal(sink.countHarvestedRecords(), 3);
+ rmSync(root, { recursive: true, force: true });
 });
 
 test("getSinkStats: returns path, count, size for the current month", async () => {
@@ -212,9 +218,10 @@ test("currentSinkFilename: format is trajectories_YYYY_MM.jsonl", () => {
  assert.equal(sink.currentSinkFilename(fixed3), "trajectories_2027_01.jsonl");
 });
 
-test("currentSinkPath: full path under .pi/harvest/", () => {
+test("currentSinkPath: full path under the harvest root", () => {
  const p = sink.currentSinkPath("/tmp/proj", new Date(Date.UTC(2026, 8, 21)));
- assert.match(p, /[\\/]\.pi[\\/]harvest[\\/]trajectories_2026_09\.jsonl$/);
+ assert.ok(p.endsWith(join("trajectories_2026_09.jsonl")), "expected date-stamped basename, got " + p);
+ assert.ok(p.includes("harvest"), "expected path under a harvest root, got " + p);
 });
 
 test("writeTrajectoryRecord: routes to date-stamped file, not trajectories.jsonl", async () => {
@@ -411,9 +418,10 @@ test("currentSftSinkFilename: format is sft_golden_YYYY_MM.jsonl", () => {
  assert.equal(sink.currentSftSinkFilename(fixed3), "sft_golden_2027_01.jsonl");
 });
 
-test("currentSftSinkPath: full path under .pi/harvest/", () => {
+test("currentSftSinkPath: full path under the harvest root", () => {
  const p = sink.currentSftSinkPath("/tmp/proj", new Date(Date.UTC(2026, 8, 21)));
- assert.match(p, /[\\/]\.pi[\\/]harvest[\\/]sft_golden_2026_09\.jsonl$/);
+ assert.ok(p.endsWith(join("sft_golden_2026_09.jsonl")), "expected date-stamped basename, got " + p);
+ assert.ok(p.includes("harvest"), "expected path under a harvest root, got " + p);
 });
 
 test("appendGoldenSFT: creates .pi/harvest and writes one JSON line", async () => {
@@ -475,8 +483,9 @@ test("countSftRecords: counts lines in the current month's sink", async () => {
 });
 
 test("countSftRecords: returns 0 when sink file is missing", () => {
- const cwd = join(tmpdir(), "pi-harvest-missing-sft-" + Date.now());
- assert.equal(sink.countSftRecords(cwd), 0);
+ const root = join(tmpdir(), "pi-harvest-missing-sft-" + Date.now());
+ process.env.PI_HARVEST_ROOT = root;
+ assert.equal(sink.countSftRecords(), 0);
 });
 
 test("listSftFiles: discovers sft_golden files and ignores other files", async () => {
@@ -498,6 +507,7 @@ test("listSftFiles: discovers sft_golden files and ignores other files", async (
 });
 
 test("listSftFiles: returns empty array when .pi/harvest is missing", () => {
- const cwd = join(tmpdir(), "pi-harvest-no-harvest-" + Date.now());
- assert.deepEqual(sink.listSftFiles(cwd), []);
+ const root = join(tmpdir(), "pi-harvest-no-harvest-" + Date.now());
+ process.env.PI_HARVEST_ROOT = root;
+ assert.deepEqual(sink.listSftFiles(), []);
 });

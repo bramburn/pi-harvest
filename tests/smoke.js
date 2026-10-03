@@ -23,6 +23,7 @@ const path = require("node:path");
 const assert = require("node:assert/strict");
 
 const extension = require("../dist/index.js").default;
+const { migrateLegacyHarvest, resolveHarvestRoot } = require("../dist/paths.js");
 
 async function startMockVerifier(responder) {
  return new Promise((resolve) => {
@@ -158,6 +159,16 @@ function readJsonl(jsonlPath) {
 
 async function main() {
  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harvest-smoke-"));
+ // Pin the harvest root under the temp dir so writes land inside it
+ // and the final rm(cwd) cleanup reclaims them. See src/paths.js.
+ process.env.PI_HARVEST_ROOT = path.join(cwd, ".pi", "harvest");
+ // chdir into a clean workspace so the extension's startup migration
+ // (which scans process.cwd()/.pi/harvest) finds nothing and the
+ // record-count assertions below stay deterministic.
+ const cleanWs = path.join(cwd, "clean-ws");
+ fs.mkdirSync(cleanWs, { recursive: true });
+ const originalCwd = process.cwd();
+ process.chdir(cleanWs);
  const d = new Date();
  const y = d.getUTCFullYear();
  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -364,6 +375,9 @@ async function main() {
  },
  ];
  cwd1b = fs.mkdtempSync(path.join(os.tmpdir(), "pi-harvest-smoke-1b-"));
+ // Scenario 1b needs its own harvest root so its records don't land in
+ // the same file as scenario 1's (the sink root is global now).
+ process.env.PI_HARVEST_ROOT = path.join(cwd1b, ".pi", "harvest");
  const jsonlPath1b = path.join(
  cwd1b,
  ".pi",
@@ -494,6 +508,8 @@ async function main() {
  }
  guardMock.server.close();
  process.env.VERIFIER_BASE_URL = savedBaseUrl;
+ // Restore scenario 1's harvest root for the remaining sections.
+ process.env.PI_HARVEST_ROOT = path.join(cwd, ".pi", "harvest");
  }
 
  // -----------------------------------------------------------------------
@@ -699,6 +715,46 @@ async function main() {
  // -----------------------------------------------------------------------
  assert.match(jsonlPath, /trajectories_\d{4}_\d{2}\.jsonl$/);
 
+ // -----------------------------------------------------------------------
+ // 9. Legacy migration — <cwd>/.pi/harvest/*.jsonl is copied into the
+ // user-home harvest root without deleting the originals.
+ // -----------------------------------------------------------------------
+ {
+ const legacyWs = path.join(cwd, "legacy-ws");
+ const legacyDir = path.join(legacyWs, ".pi", "harvest");
+ fs.mkdirSync(legacyDir, { recursive: true });
+ const legacyFile = path.join(legacyDir, "trajectories_2026_01.jsonl");
+ fs.writeFileSync(legacyFile, '{"legacy":1}\n{"legacy":2}\n', "utf8");
+
+ const migratedRoot = path.join(cwd, "migrated-root");
+ const savedRoot = process.env.PI_HARVEST_ROOT;
+ process.env.PI_HARVEST_ROOT = migratedRoot;
+ try {
+ const result = migrateLegacyHarvest(legacyWs);
+ assert.equal(result.migrated.length, 1, "one legacy .jsonl should migrate");
+ assert.equal(result.skipped.length, 0);
+ assert.equal(result.targetRoot, migratedRoot);
+
+ const copied = path.join(migratedRoot, "trajectories_2026_01.jsonl");
+ assert.ok(fs.existsSync(copied), "migrated file must exist at the user-home root");
+ assert.equal(fs.readFileSync(copied, "utf8"), '{"legacy":1}\n{"legacy":2}\n');
+ // Originals are NOT deleted (copy, not move).
+ assert.ok(fs.existsSync(legacyFile), "legacy original must be preserved");
+ assert.equal(fs.readFileSync(legacyFile, "utf8"), '{"legacy":1}\n{"legacy":2}\n');
+ // Re-running must not duplicate or clobber.
+ const again = migrateLegacyHarvest(legacyWs);
+ assert.equal(again.migrated.length, 0, "second run should be a no-op");
+ assert.equal(again.skipped.length, 1);
+ assert.equal(fs.readFileSync(copied, "utf8"), '{"legacy":1}\n{"legacy":2}\n');
+
+ console.log(" legacy migration: copied 1 file to " + migratedRoot + " (original preserved)");
+ } finally {
+ process.env.PI_HARVEST_ROOT = savedRoot;
+ fs.rmSync(legacyWs, { recursive: true, force: true });
+ fs.rmSync(migratedRoot, { recursive: true, force: true });
+ }
+ }
+
  console.log("Steering-hardening smoke test PASSED");
  console.log(" DPO entries written: " + jsonlPath + " (" + readJsonl(jsonlPath).length + " records)");
  console.log(" session_id: " + entry.session_id);
@@ -715,7 +771,9 @@ async function main() {
  console.log(" rewind navigations: " + pi.calls.navigateTree.length);
  } finally {
  mock.server.close();
+ process.chdir(originalCwd);
  fs.rmSync(cwd, { recursive: true, force: true });
+ delete process.env.PI_HARVEST_ROOT;
  delete process.env.VERIFIER_BASE_URL;
  delete process.env.VERIFIER_API_KEY;
  delete process.env.VERIFIER_MODEL;
