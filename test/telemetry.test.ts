@@ -12,7 +12,11 @@ import * as telemetry from "../dist/telemetry.js";
 import * as sink from "../dist/sink.js";
 
 async function tmpCwd() {
- return await mkdtemp(join(tmpdir(), "pi-harvest-telemetry-"));
+ const dir = await mkdtemp(join(tmpdir(), "pi-harvest-telemetry-"));
+ // Pin the harvest root under the temp dir so writes land inside it
+ // and the test's rm(cwd) cleanup reclaims them. See ./paths.js.
+ process.env.PI_HARVEST_ROOT = join(dir, ".pi", "harvest");
+ return dir;
 }
 
 async function writeRecords(cwd: string, records: any[]) {
