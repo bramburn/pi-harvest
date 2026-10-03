@@ -29,11 +29,12 @@ export interface TelemetrySummary {
 /**
  * Stream-read the active month's sink and tally `k3_audit.flaw_category`.
  *
- * @param cwd - workspace root
+ * @param cwd - unused (kept for API compatibility; the sink root is
+ * resolved via `resolveHarvestRoot()` — see ./paths.js)
  * @param topN - number of top flaws to return (default 3 per spec)
  */
-export async function aggregateTelemetry(cwd: string, topN: number = 3): Promise<TelemetrySummary> {
- const sinkPath = currentSinkPath(cwd);
+export async function aggregateTelemetry(_cwd: string, topN: number = 3): Promise<TelemetrySummary> {
+ const sinkPath = currentSinkPath();
  const empty: TelemetrySummary = {
  sinkPath,
  recordCount: 0,
