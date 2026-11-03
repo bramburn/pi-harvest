@@ -1,37 +1,41 @@
 {
-  "name": "pi-harvest",
-  "version": "0.10.0",
-  "description": "Trajectory harvester extension for pi.dev — monitors local worker model runs and intercepts compilation failure loops.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
-  "scripts": {
-    "build": "tsc",
-    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/paths.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts test/splice.test.ts test/config.test.ts test/db.test.ts",
-    "smoke": "npm run build && node tests/smoke.js",
-    "prepublishOnly": "npm run build && npm test && npm run smoke"
-  },
-  "keywords": [
-    "pi",
-    "pi-extension",
-    "pi.dev",
-    "harvest",
-    "trajectory",
-    "agent",
-    "telemetry"
-  ],
-  "author": "bramburn",
-  "license": "MIT",
-  "engines": {
-    "node": ">=22.19.0"
-  },
-  "pi": {
-    "extensions": [
-      "./dist/index.js"
-    ]
-  }
+ "name": "pi-harvest",
+ "version": "0.10.0",
+ "description": "Trajectory harvester extension for pi.dev — monitors local worker model runs and intercepts compilation failure loops.",
+ "main": "dist/index.js",
+ "types": "dist/index.d.ts",
+ "files": [
+  "dist",
+  "README.md",
+  "LICENSE"
+ ],
+ "scripts": {
+  "build": "tsc",
+  "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/paths.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts test/splice.test.ts test/config.test.ts test/db.test.ts",
+  "smoke": "npm run build && node tests/smoke.js",
+  "prepublishOnly": "npm run build && npm test && npm run smoke"
+ },
+ "devDependencies": {
+  "@types/node": "^26.6.2",
+  "typescript": "^7.0.2"
+ },
+ "keywords": [
+  "pi",
+  "pi-extension",
+  "pi.dev",
+  "harvest",
+  "trajectory",
+  "agent",
+  "telemetry"
+ ],
+ "author": "bramburn",
+ "license": "MIT",
+ "engines": {
+  "node": ">=22.19.0"
+ },
+ "pi": {
+  "extensions": [
+   "./dist/index.js"
+  ]
+ }
 }
