@@ -2,6 +2,14 @@
  "name": "pi-harvest",
  "version": "0.10.0",
  "description": "Trajectory harvester extension for pi.dev — monitors local worker model runs and intercepts compilation failure loops.",
+ "repository": {
+  "type": "git",
+  "url": "git+https://github.com/bramburn/pi-harvest.git"
+ },
+ "homepage": "https://github.com/bramburn/pi-harvest#readme",
+ "bugs": {
+  "url": "https://github.com/bramburn/pi-harvest/issues"
+ },
  "main": "dist/index.js",
  "types": "dist/index.d.ts",
  "files": [
