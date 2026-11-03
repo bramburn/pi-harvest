@@ -24,6 +24,7 @@ const assert = require("node:assert/strict");
 
 const extension = require("../dist/index.js").default;
 const { migrateLegacyHarvest, resolveHarvestRoot } = require("../dist/paths.js");
+const db = require("../dist/db.js");
 
 async function startMockVerifier(responder) {
  return new Promise((resolve) => {
@@ -755,6 +756,98 @@ async function main() {
  }
  }
 
+ // -----------------------------------------------------------------------
+ // 10. SQLite dual-write + /harvest-settings
+ // -----------------------------------------------------------------------
+ {
+ const harvestRoot = process.env.PI_HARVEST_ROOT;
+ const dbPath = path.join(harvestRoot, "harvest.db");
+ assert.ok(fs.existsSync(dbPath), "harvest.db must be created by the dual-write sink");
+
+ const stats = db.getDbStats();
+ assert.equal(stats.available, true, "node:sqlite should be available on Node >= 22.13");
+ assert.ok(stats.dpoCount >= 3, "every JSONL DPO record should also land in SQLite (got " + stats.dpoCount + ")");
+ assert.ok(stats.sftCount >= 1, "resolved DPO episodes should be promoted into sft_records (got " + stats.sftCount + ")");
+
+ // Export dedupe must not double-count: JSONL rows and SQLite rows share
+ // the same record hash, and the export above saw exactly 3 records.
+ const dpoRows = db.readDpoRows();
+ assert.ok(dpoRows.length >= 3);
+ assert.ok(dpoRows.every(function (row) { return typeof row.record_hash === "string" && row.record_hash.length === 64; }));
+ assert.ok(dpoRows.some(function (row) { return /json/i.test(row.active_files_json) || row.active_files_json === "[]"; }));
+
+ // /harvest-settings: registry-backed model picker.
+ assert.ok(pi.commands["harvest-settings"], "registerCommand should be called with 'harvest-settings'");
+ const settingsPath = path.join(harvestRoot, "settings.json");
+ const selectTitles = [];
+ const settingsCtx = Object.assign({}, ctx, {
+ modelRegistry: {
+ getAvailable: function () {
+ return [
+ { provider: "deepseek", id: "deepseek-chat", name: "DeepSeek Chat" },
+ { provider: "alibaba", id: "qwen3-coder-plus" },
+ { provider: "openrouter", id: "qwen/qwen3-coder" },
+ ];
+ },
+ },
+ ui: {
+ setStatus: function () {},
+ notify: function (msg) { pi.notifyCalls.push(msg); },
+ select: async function (title, options) {
+ selectTitles.push(title);
+ // The keyword pre-filter ("qwen") must only surface qwen-ish models.
+ assert.ok(options.every(function (o) { return typeof o === "string"; }));
+ return "alibaba/qwen3-coder-plus";
+ },
+ input: async function () { return undefined; },
+ },
+ });
+
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest-settings", "qwen", settingsCtx);
+ const settingsMsg = pi.notifyCalls.find(function (m) { return /Supervisor saved/.test(m); });
+ assert.ok(settingsMsg, "settings command should confirm the saved supervisor");
+
+ const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+ assert.equal(saved.supervisorProvider, "alibaba");
+ assert.equal(saved.supervisorModelId, "qwen3-coder-plus");
+ assert.equal(saved.supervisorBaseUrl, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+ assert.ok(typeof saved.updatedAt === "string" && saved.updatedAt.length > 0);
+
+ // /harvest settings is an alias and status reflects the saved supervisor.
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest", "status", settingsCtx);
+ const settingsStatus = pi.notifyCalls.find(function (m) { return /\[Harvester\]/.test(m); });
+ assert.ok(settingsStatus, "status should still emit a [Harvester] notification");
+ assert.match(settingsStatus, /model=qwen3-coder-plus \(settings\.json\)/);
+ assert.match(settingsStatus, /Settings:/);
+ assert.match(settingsStatus, /SQLite: .*harvest\.db sft=\d+ dpo=\d+/);
+
+ // Interactive menu path (no keyword): view the configuration, then exit.
+ let menuPicks = 0;
+ const menuCtx = Object.assign({}, settingsCtx, {
+ ui: Object.assign({}, settingsCtx.ui, {
+ select: async function (title) {
+ if (title !== "Harvester Settings") return "Cancel";
+ menuPicks += 1;
+ return menuPicks === 1 ? "View current configuration" : "Cancel";
+ },
+ }),
+ });
+ pi.notifyCalls.length = 0;
+ await pi._callCommand("harvest-settings", "", menuCtx);
+ assert.ok(pi.notifyCalls.some(function (m) { return /Settings file: /.test(m); }), "menu should print the configuration");
+
+ // Leave no settings behind: the real user home must not be touched, and
+ // subsequent runs should start from env config again.
+ fs.rmSync(settingsPath, { force: true });
+ delete process.env.VERIFIER_PROVIDER;
+ delete process.env.VERIFIER_MODEL;
+ delete process.env.VERIFIER_BASE_URL;
+ console.log(" SQLite dual-write: sft=" + stats.sftCount + " dpo=" + stats.dpoCount + " @ " + dbPath);
+ console.log(" /harvest-settings: saved + reloaded alibaba/qwen3-coder-plus");
+ }
+
  console.log("Steering-hardening smoke test PASSED");
  console.log(" DPO entries written: " + jsonlPath + " (" + readJsonl(jsonlPath).length + " records)");
  console.log(" session_id: " + entry.session_id);
@@ -771,6 +864,9 @@ async function main() {
  console.log(" rewind navigations: " + pi.calls.navigateTree.length);
  } finally {
  mock.server.close();
+ // Connections are per-operation, but keep the explicit release so a
+ // future cached handle cannot reintroduce the Windows EBUSY on rm.
+ db.closeDatabase();
  process.chdir(originalCwd);
  fs.rmSync(cwd, { recursive: true, force: true });
  delete process.env.PI_HARVEST_ROOT;

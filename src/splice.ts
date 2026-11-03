@@ -17,6 +17,7 @@
  */
 
 import type { NeatSlice, VerifierAudit } from "./types.js";
+import { resolveSupervisorIdentity } from "./config.js";
 import { entryIdForDivergenceTurn, enforcePayloadSize } from "./slice.js";
 
 /**
@@ -33,13 +34,15 @@ export interface SteeringContext {
 }
 
 /**
- * Resolve the Tier-3 steer provider tag from the environment.
- * VERIFIER_PROVIDER selects the commander (default k3, "deepseek" is
- * the documented fallback); the value is uppercased and sanitized so
- * the tag stays a single greppable token.
+ * Resolve the Tier-3 steer provider tag.
+ *
+ * Source of truth is the same resolver the verifier uses: the provider
+ * saved by `/harvest-settings` wins over `VERIFIER_PROVIDER`, which wins
+ * over the historical `k3` default. The value is uppercased and sanitized
+ * so the tag stays a single greppable token (e.g. [STEER:DEEPSEEK]).
  */
 export function steerProviderTag(): string {
- const raw = (process.env.VERIFIER_PROVIDER ?? "k3").trim().toUpperCase();
+ const raw = resolveSupervisorIdentity().provider.trim().toUpperCase();
  const sanitized = raw.replace(/[^A-Z0-9_-]/g, "");
  return sanitized.length > 0 ? sanitized : "K3";
 }

@@ -286,3 +286,72 @@ test("exportToHuggingFaceSFT: handles empty SFT sink gracefully", async () => {
  await rm(cwd, { recursive: true, force: true });
  }
 });
+
+test("exportToHuggingFaceSFT: dedupes JSONL+SQLite and still exports SQLite-only rows", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const record = {
+ session_id: "s1",
+ timestamp: "2026-09-21T10:00:00.000Z",
+ worker_model: "minimax",
+ domain_tags: ["rust"],
+ immediate_prompt: "add greet",
+ active_files: [{ path: "src/main.rs", content: "fn main() {}" }],
+ git_diff_summary: null,
+ chosen_completion: "fn ok() {}",
+ };
+ sink.appendGoldenSFT(cwd, record as never);
+
+ // Both stores contain the record; the hash dedupe must emit it once.
+ let result = await exporter.exportToHuggingFaceSFT({ cwd });
+ assert.equal(result.count, 1);
+ assert.ok(result.sources.some((s) => s.endsWith("harvest.db")), "DB must be listed as a source");
+
+ // Rotate the JSONL away: the SQLite mirror still has to produce the row.
+ await rm(sink.currentSftSinkPath(cwd), { force: true });
+ result = await exporter.exportToHuggingFaceSFT({ cwd });
+ assert.equal(result.count, 1);
+ const lines = (await readFile(result.path, "utf8")).trim().split("\n");
+ assert.equal(lines.length, 1);
+ const parsed = JSON.parse(lines[0]) as { messages: Array<{ role: string; content: string }> };
+ assert.equal(parsed.messages.length, 2);
+ assert.equal(parsed.messages[1].content, "fn ok() {}");
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});
+
+test("exportToHuggingFaceDPO: dedupes JSONL+SQLite and still exports SQLite-only rows", async () => {
+ const cwd = await tmpCwd();
+ try {
+ const record = {
+ session_id: "s1",
+ timestamp: "2026-09-21T10:00:00.000Z",
+ worker_model: "minimax",
+ verifier_model: "deepseek-chat",
+ trigger_reason: "compiler_streak",
+ domain_tags: ["rust"],
+ immediate_prompt: "fix it",
+ active_files: [{ path: "src/main.rs", content: "fn main() {}" }],
+ compiler_error_summary: "error[E0425]",
+ git_diff_summary: null,
+ k3_audit: { flaw_category: "logic_error", root_cause: "x" },
+ rejected_completion: "broken",
+ chosen_completion: "fixed",
+ human_feedback: null,
+ };
+ sink.writeTrajectoryRecord(record as never);
+
+ let result = await exporter.exportToHuggingFaceDPO({ cwd });
+ assert.equal(result.count, 1);
+
+ await rm(sink.currentSinkPath(cwd), { force: true });
+ result = await exporter.exportToHuggingFaceDPO({ cwd });
+ assert.equal(result.count, 1);
+ const lines = (await readFile(result.path, "utf8")).trim().split("\n");
+ const parsed = JSON.parse(lines[0]) as { chosen: Array<{ content: string }> };
+ assert.equal(parsed.chosen[0].content, "fixed");
+ } finally {
+ await rm(cwd, { recursive: true, force: true });
+ }
+});

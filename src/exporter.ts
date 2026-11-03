@@ -1,31 +1,48 @@
 /**
- * Native HuggingFace DPO dataset exporter (Phase 4).
+ * Native HuggingFace SFT/DPO dataset exporter.
  *
- * Reads all `<harvestRoot>/trajectories*.jsonl` files via streaming
- * (line-by-line, never loads the full file into RAM), maps each record
- * into the HF conversational DPO format expected by `trl.DPOTrainer`:
+ * Reads all `<harvestRoot>/trajectories*.jsonl` + `sft_golden*.jsonl`
+ * files via streaming (line-by-line, never loads the full file into RAM),
+ * merges in rows from the SQLite mirror (`harvest.db`), and maps each
+ * record into the conversational formats expected by `trl.DPOTrainer`:
  *
+ * DPO:
  * {
- *   "prompt":   [{ "role": "user", "content": "<multi-line>" }],
- *   "chosen":   [{ "role": "assistant", "content": "<chosen>" }],
- *   "rejected": [{ "role": "assistant", "content": "<rejected>" }],
- *   "flaw_category": "..."
+ * "prompt": [{ "role": "user", "content": "<multi-line>" }],
+ * "chosen": [{ "role": "assistant", "content": "<chosen>" }],
+ * "rejected": [{ "role": "assistant", "content": "<rejected>" }],
+ * "flaw_category": "..."
  * }
+ *
+ * SFT:
+ * { "messages": [{ "role": "user", ... }, { "role": "assistant", ... }] }
  *
  * The `prompt` content concatenates:
  * 1. the Inception Prompt (immediate_prompt)
  * 2. the clamped git_diff_summary (or a no-diff placeholder)
  * 3. a per-file context dump (path + clamped content) for each active file
  *
- * Output: `<harvestRoot>/exports/dpo_dataset_YYYY_MM_DD.jsonl`.
+ * Deduplication: dual-written records appear in both JSONL and SQLite.
+ * Both paths key off the same deterministic record hash (see ./db.ts), so
+ * an episode is exported exactly once no matter which store it came from.
+ *
+ * Output: `<harvestRoot>/exports/dpo_dataset_YYYY_MM_DD.jsonl` and
+ * `<harvestRoot>/exports/sft_dataset_YYYY_MM_DD.jsonl`.
  */
 
 import { appendFileSync, createReadStream, mkdirSync, existsSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 import { listSinkFiles, listSftFiles } from "./sink.js";
-import { resolveHarvestRoot, ensureHarvestRoot } from "./paths.js";
+import { ensureHarvestRoot } from "./paths.js";
+import {
+ computeDpoRecordHash,
+ computeSftRecordHash,
+ getDbPath,
+ readDpoRows,
+ readSftRows,
+} from "./db.js";
 
 export interface ExportOptions {
  cwd: string;
@@ -37,6 +54,15 @@ export interface ExportResult {
  count: number;
  bytes: number;
  sources: string[];
+}
+
+function safeJsonParse<T>(raw: unknown, fallback: T): T {
+ if (typeof raw !== "string" || raw.length === 0) return fallback;
+ try {
+ return JSON.parse(raw) as T;
+ } catch {
+ return fallback;
+ }
 }
 
 /**
@@ -109,6 +135,11 @@ export function exportFilename(now: Date = new Date()): string {
 /**
  * Stream-read every sink file and append mapped HF-DPO records to the
  * export file. Returns the output path + record count.
+ *
+ * Sources are the rotated JSONL files AND the SQLite `dpo_records`
+ * table. Rows are deduplicated by the same deterministic record hash the
+ * DB uses, so dual-written episodes appear exactly once regardless of
+ * which store they came from.
  */
 export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<ExportResult> {
  const now = opts.now ?? new Date();
@@ -120,8 +151,18 @@ export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<Expor
  writeFileSync(outPath, "", { encoding: "utf8" });
 
  const sources = listSinkFiles(opts.cwd);
+ const seen = new Set<string>();
  let count = 0;
  let bytes = 0;
+
+ const emit = (mapped: unknown, hash: string): void => {
+ if (seen.has(hash)) return;
+ seen.add(hash);
+ const out = JSON.stringify(mapped) + "\n";
+ appendFileSync(outPath, out, { encoding: "utf8" });
+ count++;
+ bytes += Buffer.byteLength(out, "utf8");
+ };
 
  for (const sourcePath of sources) {
  if (!existsSync(sourcePath)) continue;
@@ -139,16 +180,29 @@ export async function exportToHuggingFaceDPO(opts: ExportOptions): Promise<Expor
  } catch {
  return;
  }
- const mapped = mapRecordToHfDpo(parsed);
- const out = JSON.stringify(mapped) + "\n";
- appendFileSync(outPath, out, { encoding: "utf8" });
- count++;
- bytes += Buffer.byteLength(out, "utf8");
+ emit(mapRecordToHfDpo(parsed), computeDpoRecordHash(parsed));
  });
  rl.on("close", () => resolve());
  rl.on("error", reject);
  });
  }
+
+ // SQLite-only rows (e.g. records inserted by a migration whose JSONL
+ // source was later rotated away).
+ let usedDb = false;
+ for (const row of readDpoRows()) {
+ usedDb = true;
+ const record = {
+ immediate_prompt: row.immediate_prompt,
+ git_diff_summary: row.git_diff_summary,
+ active_files: safeJsonParse<unknown[]>(row.active_files_json, []),
+ chosen_completion: row.chosen_completion,
+ rejected_completion: row.rejected_completion,
+ k3_audit: safeJsonParse<Record<string, unknown>>(row.k3_audit_json, {}),
+ };
+ emit(mapRecordToHfDpo(record), row.record_hash || computeDpoRecordHash(row));
+ }
+ if (usedDb && !sources.includes(getDbPath())) sources.push(getDbPath());
 
  return { path: outPath, count, bytes, sources };
 }
@@ -209,7 +263,9 @@ export function sftExportFilename(now: Date = new Date()): string {
 
 /**
  * Stream-read every SFT Golden sink file and append mapped HF-SFT
- * records to the export file. Returns the output path + record count.
+ * records to the export file. SQLite `sft_records` (including rows
+ * promoted from resolved DPO episodes) are merged in and deduplicated
+ * by record hash.
  */
 export async function exportToHuggingFaceSFT(opts: ExportOptions): Promise<ExportResult> {
  const now = opts.now ?? new Date();
@@ -220,8 +276,18 @@ export async function exportToHuggingFaceSFT(opts: ExportOptions): Promise<Expor
  writeFileSync(outPath, "", { encoding: "utf8" });
 
  const sources = listSftFiles(opts.cwd);
+ const seen = new Set<string>();
  let count = 0;
  let bytes = 0;
+
+ const emit = (mapped: unknown, hash: string): void => {
+ if (seen.has(hash)) return;
+ seen.add(hash);
+ const out = JSON.stringify(mapped) + "\n";
+ appendFileSync(outPath, out, { encoding: "utf8" });
+ count++;
+ bytes += Buffer.byteLength(out, "utf8");
+ };
 
  for (const sourcePath of sources) {
  if (!existsSync(sourcePath)) continue;
@@ -239,16 +305,28 @@ export async function exportToHuggingFaceSFT(opts: ExportOptions): Promise<Expor
  } catch {
  return;
  }
- const mapped = mapRecordToHfSFT(parsed);
- const out = JSON.stringify(mapped) + "\n";
- appendFileSync(outPath, out, { encoding: "utf8" });
- count++;
- bytes += Buffer.byteLength(out, "utf8");
+ emit(mapRecordToHfSFT(parsed), computeSftRecordHash(parsed));
  });
  rl.on("close", () => resolve());
  rl.on("error", reject);
  });
  }
+
+ let usedDb = false;
+ for (const row of readSftRows()) {
+ usedDb = true;
+ // `messages_json` is the bare HF message array (see db.buildSftMessagesJson),
+ // but tolerate both a raw array and a `{ messages: [...] }` wrapper.
+ const parsed = safeJsonParse<unknown>(row.messages_json, []);
+ const messages = Array.isArray(parsed)
+ ? parsed
+ : parsed && typeof parsed === "object" && Array.isArray((parsed as { messages?: unknown }).messages)
+ ? (parsed as { messages: unknown[] }).messages
+ : [];
+ if (messages.length === 0) continue;
+ emit({ messages }, row.record_hash);
+ }
+ if (usedDb && !sources.includes(getDbPath())) sources.push(getDbPath());
 
  return { path: outPath, count, bytes, sources };
 }

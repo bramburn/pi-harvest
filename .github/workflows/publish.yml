@@ -1,0 +1,101 @@
+name: Publish to npm
+
+# Trusted publishing (OIDC) — no NPM_TOKEN secret exists in this repo.
+# npm trusts this exact workflow (`.github/workflows/publish.yml`) running in
+# the `npm-publish` environment on `bramburn/pi-harvest`.
+#
+# NOTE: npm requires one successful publish from this workflow before the
+# trusted-publisher config is validated (see the pending-validation banner on
+# the package settings page). The deadline is 2026-11-05.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Pack + verify only, do not publish"
+        type: boolean
+        default: false
+      dist-tag:
+        description: "npm dist-tag (e.g. latest, next)"
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC trusted publishing + provenance
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm >= 11.5.1. Node 24 ships npm 11.x, but
+      # pin the floor explicitly so a future runner image cannot regress it.
+      - name: Ensure npm supports OIDC trusted publishing
+        run: |
+          npm install -g npm@latest
+          node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (v[0]<11 || (v[0]===11 && v[1]<5) || (v[0]===11 && v[1]===5 && v[2]<1)) { console.error('npm >= 11.5.1 required, got', v.join('.')); process.exit(1) }"
+
+      - name: Install (lockfile-exact)
+        run: npm ci
+
+      # `prepublishOnly` (package.json) runs build + unit tests + smoke test
+      # as part of `npm publish`, so a red suite can never ship. Do not
+      # duplicate them here.
+
+      - name: Sanity-check version/tag alignment
+        if: github.event_name == 'release'
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG_VERSION release=$TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match release tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Check whether this version is already on npm
+        id: check
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if npm view "pi-harvest@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "pi-harvest@${PKG_VERSION} is already published; skipping."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack (dry run)
+        if: inputs.dry-run
+        run: npm pack --dry-run
+
+      - name: Publish (trusted publisher, OIDC)
+        if: ${{ !inputs.dry-run && steps.check.outputs.published == 'false' }}
+        run: npm publish --access public --tag "${{ inputs.dist-tag || 'latest' }}"
+
+      - name: Summary
+        run: |
+          echo "### pi-harvest publish" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- version: \`$(node -p "require('./package.json').version")\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- already published: \`${{ steps.check.outputs.published }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- dry run: \`${{ inputs.dry-run || 'false' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- auth: OIDC trusted publishing (\`npm-publish\` environment)" >> "$GITHUB_STEP_SUMMARY"

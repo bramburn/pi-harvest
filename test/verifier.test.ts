@@ -6,6 +6,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Isolate from the developer's real ~/.pi/harvest/settings.json: the
+// verifier resolves its endpoint from settings.json before env vars, so a
+// configured supervisor would make the "missing env" tests silently pass
+// through to a real HTTP call.
+process.env.PI_HARVEST_ROOT = join(tmpdir(), "pi-harvest-verifier-" + process.pid);
+
 import * as verifier from "../dist/verifier.js";
 import { VerifierUnavailableError } from "../dist/types.js";
 

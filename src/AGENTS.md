@@ -18,7 +18,31 @@ Starting in **Phase 2**, `src/` will split into focused modules per the structur
 
 ---
 
-## 2. Module split (target for Phase 2+)
+## 2. Module split
+
+### Actual layout (v0.9.x)
+
+The repo intentionally kept the flat single-directory layout — every file is
+under ~900 lines and has a matching `test/*.test.ts`:
+
+```
+src/
+├── index.ts      # lifecycle wiring + /harvest, /harvest-settings commands
+├── types.ts      # shared record/audit types
+├── signatures.ts # compiler-failure detection (always lowercase first)
+├── slice.ts      # Neat Slice: backward traversal + file snapshots + git diff
+├── splice.ts     # rewind + [STEER:<provider>] injection
+├── sink.ts       # JSONL writers (trajectories + sft_golden) and rotation
+├── exporter.ts   # HF DPO/SFT export, JSONL + SQLite, hash-deduped
+├── verifier.ts   # one POST per audit/distill/review/opinion call
+├── telemetry.ts  # flaw-category aggregation
+├── paths.ts      # harvest-root resolution + legacy migration
+├── workspace.ts  # cwd-relative path handling
+├── config.ts     # settings.json + supervisor resolution precedence
+└── db.ts         # node:sqlite mirror (sft_records / dpo_records)
+```
+
+### Target split (only if a file outgrows ~900 lines)
 
 ```
 src/
@@ -53,6 +77,8 @@ src/
 | `splice/engine.ts` | Call `ctx.sessionManager.prune(divergenceTurn)`, then `pi.sendMessage(steeringSpec, { deliverAs: "steer", triggerTurn: true })`. | `async function performSplice(ctx, auditResult): Promise<void>` |
 | `sink/jsonl.ts` | `fs.mkdirSync(.pi/harvest, { recursive: true })` + `fs.appendFileSync(trajectories.jsonl, JSON.stringify(record) + "\n")`. | `function appendTrajectory(record): void` |
 | `commands/audit.ts` | `pi.registerCommand("k3-audit", ...)` — manually force an audit and inject the steering. | `function registerAuditCommand(pi, ctx): void` |
+| `config.ts` | Persistent supervisor settings + resolution. Precedence: `settings.json` → `ctx.modelRegistry` → `VERIFIER_*` env → provider defaults. Also enumerates registry models for the picker. | `loadSettings`, `saveSettings`, `listRegistryModels`, `resolveSupervisorConfig(ctx?)`, `resolveSupervisorIdentity()` |
+| `db.ts` | SQLite mirror. Lazy `require("node:sqlite")` so older Node never crashes. Per-operation connection (`withDb`), WAL, `INSERT OR IGNORE` on a SHA-256 `record_hash`, DPO→SFT promotion, JSONL migration. **Must not import `sink.ts`/`exporter.ts`** (cycle). | `initDatabase`, `insertSftRecord`, `insertDpoRecord`, `readSftRows`, `readDpoRows`, `getDbStats`, `migrateJsonlToSqlite`, `computeDpoRecordHash`, `computeSftRecordHash`, `isSqliteAvailable` |
 
 ---
 

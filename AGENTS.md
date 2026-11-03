@@ -15,12 +15,15 @@ The system is designed for **months of organic data capture** so the user can ev
 | Path | What it owns |
 |------|--------------|
 | `src/` | Extension source. Phase 1 ships as a single `index.ts`; later phases will split into `verifier/`, `slice/`, `splice/`, `sink/`, `commands/` (see § 6 / [src/AGENTS.md](./src/AGENTS.md)). |
-| `src/index.ts` | Extension entry — `pi.on("tool_result")` + `pi.on("turn_end")` lifecycle hooks. Owns local state (`turnCounter`, `compilerFailStreak`). |
+| `src/index.ts` | Extension entry — `pi.on("tool_result")` + `pi.on("turn_end")` lifecycle hooks. Owns local state (`turnCounter`, `compilerFailStreak`) and the `/harvest*` commands (incl. `/harvest-settings`). |
+| `src/config.ts` | Persistent supervisor settings (`<harvestRoot>/settings.json`) + resolution precedence `settings.json → model registry → VERIFIER_* env → provider defaults`. `resolveSupervisorConfig()` / `resolveSupervisorIdentity()`. |
+| `src/db.ts` | SQLite mirror (`<harvestRoot>/harvest.db`) via Node's built-in `node:sqlite`. Schema, hashed inserts, SFT promotion, `migrateJsonlToSqlite()`, stats. |
 | `dist/` | `tsc` build output. `main` in `package.json` points at `dist/index.js`. **Never edit by hand.** |
 | `tests/` | Smoke tests for the compiled extension against a mock pi runtime. See [tests/AGENTS.md](./tests/AGENTS.md). |
-| `package.json` | npm metadata, `build` / `prepublishOnly` scripts, `engines: node >= 18`. |
+| `package.json` | npm metadata, `build` / `test` / `smoke` / `prepublishOnly` scripts, `engines: node >= 22.19`. |
 | `tsconfig.json` | `target: ES2022`, `module: CommonJS`, `outDir: dist`, `strict: true`. |
-| `.pi/` | pi runtime state (settings, loops). **Gitignored**; this is where the harvest sink will live (Phase 4 → `.pi/harvest/trajectories.jsonl`). |
+| `.pi/` | pi runtime state (settings, loops). **Gitignored**; holds the harvest sinks (`trajectories_YYYY_MM.jsonl`, `sft_golden_YYYY_MM.jsonl`), the SQLite mirror (`harvest.db`) and `settings.json`. |
+| `.github/workflows/` | `ci.yml` (build + unit tests + smoke on push/PR) and `publish.yml` (npm trusted publishing via OIDC, environment `npm-publish`). |
 | `.gitignore` | Ignores `node_modules/`, `dist/`, `.pi/`, `.env`, IDE/OS junk. |
 | `LICENSE` | MIT (© 2026 bramburn). |
 | `README.md` | User-facing docs — install / dev loop / uninstall / detection signatures / roadmap. |
@@ -38,8 +41,11 @@ npm install
 # Build (TypeScript → dist/)
 npm run build
 
+# Unit tests (builds first; node:test over test/*.test.ts)
+npm test
+
 # Run the smoke test against the compiled extension
-node tests/smoke.js
+npm run smoke
 
 # Lint (optional — not yet wired)
 # npx tsc --noEmit
@@ -48,6 +54,7 @@ node tests/smoke.js
 ### Local install into pi (dev loop)
 
 ```bash
+npm run build # pi loads ./dist/index.js (package.json -> pi.extensions)
 pi install C:\dev\pi-harvest -l --approve
 ```
 
@@ -55,9 +62,24 @@ pi install C:\dev\pi-harvest -l --approve
 
 ### Publish to npm (release flow)
 
+Publishing is done by GitHub Actions using **npm trusted publishing (OIDC)** —
+there is no `NPM_TOKEN` secret. The trusted publisher is pinned to
+`.github/workflows/publish.yml` + the `npm-publish` environment, so:
+
 ```bash
-# pre-publish build runs automatically via prepublishOnly
-npm version patch          # bump version
+npm version patch # bump version, commit, tag
+git push origin main --follow-tags
+gh release create vX.Y.Z --generate-notes   # triggers publish.yml
+```
+
+`publish.yml` also supports `workflow_dispatch` with `dry-run: true` (pack only)
+and a `dist-tag` input. It verifies the release tag matches `package.json`,
+skips versions already on npm, and relies on `prepublishOnly` for build + unit
+tests + smoke.
+
+Local publishing still works as an escape hatch:
+
+```bash
 npm publish --access public
 ```
 
@@ -70,10 +92,13 @@ If npm prompts for a **2FA OTP**, **pause and ask the user** — do not guess or
 | Command | What it covers |
 |---------|----------------|
 | `npm run build` | TypeScript compile; must succeed with `strict: true`. |
-| `node tests/smoke.js` | Drives a mock `pi` runtime through 7 scenarios (clean output, rust errors ×3, streak reset, non-bash tools ignored, case-insensitive scan, 30-turn interval). |
+| `npm test` | `node:test` over `test/*.test.ts` (compiled `dist/`), 176 assertions across slice/workspace/sink/paths/verifier/exporter/telemetry/splice/config/db. |
+| `npm run smoke` | Drives a mock `pi` runtime through the full audit -> splice -> resolve -> export -> SQLite -> settings flow. |
 | `pi install C:\dev\pi-harvest -l --approve` | End-to-end install in a real pi session — `[Harvester] Turn: 0 \| Streak: 0` widget should appear in the status bar. |
 
-CI is not yet configured. Tests are run locally before every `npm publish`.
+CI lives in `.github/workflows/ci.yml`: Ubuntu (Node 22 + 24) and Windows (Node 24)
+run `npm ci`, `npm run build`, `npm test`, `npm run smoke` and `npm pack --dry-run`
+on every push to `main` and every PR. Tests also run locally before every publish.
 
 ---
 
@@ -89,15 +114,18 @@ These rules are **opinionated** and trace back to the plan. They exist to protec
 
 ### Data shape
 
-- **The harvest sink is append-only JSONL.** No SQLite, no Parquet, no embedded DB. JSONL keeps the schema diff-able in git for a while and is trivially mappable to `trl` DPO format via `prepare_dpo_dataset.py` (see § 8).
+- **JSONL is the canonical, append-only log; SQLite is a mirror.** Every record is still appended to `.pi/harvest/*.jsonl` first (diff-able, trivially mappable to `trl` DPO format via `prepare_dpo_dataset.py`). `src/db.ts` then mirrors the same record into `.pi/harvest/harvest.db` (`sft_records` / `dpo_records`) **inside a try/catch**. The mirror is a queryable convenience for downstream SFT/DPO pipelines, not a source of truth: a missing `node:sqlite`, a locked DB, or a corrupt file must never lose or block a trajectory. No external DB, no native module, no npm dependency — `node:sqlite` is built into Node.
+- **SQLite inserts are hash-deduped.** `record_hash` is a SHA-256 over the fields that define the training pair; inserts use `INSERT OR IGNORE`. Migration, dual-write and the HF exporter share the same hash, so a record appears exactly once in an export even though it exists on disk twice.
+- **The DB handle is per-operation.** `withDb(fn)` opens → ensures schema → runs → closes. Do not reintroduce a module-level cached handle: on Windows it makes `rm -rf` of a harvest root, test cleanup and `git clean` fail with `EBUSY`, and it holds locks across subagent sessions.
 - **Every harvested record has the DPO triplet:** `prompt` (sliced context), `chosen` (post-steer successful completion), `rejected` (pre-steer broken completion). A record missing any of the three is dropped, not stored half-formed.
+- **Supervisor config lives in `<harvestRoot>/settings.json`.** Resolution order is `settings.json` → pi's model registry (`ctx.modelRegistry`) → `VERIFIER_*` env vars → provider defaults (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, …). `src/config.ts` owns this; nothing else may hardcode a model id, base URL, or key. Error messages still say `VERIFIER_BASE_URL` / `VERIFIER_API_KEY` / `VERIFIER_MODEL` even when the value came from settings, because existing callers and tests match on those names. Never mirror the API key into `process.env` when saving — settings.json is the single source of truth for the key.
 - **Message tiers are tagged, not inferred.** The extension prefixes `[STEER:K3]` (or `[STEER:DEEPSEEK]`) on every synthetic steering message so downstream slicers can distinguish supervisor interventions from user prompts (Tier 3 vs. Tier 2 vs. Tier 1 — see § 6).
 
 ### Cross-area boundaries
 
 | Tree | May do | May NOT do |
 |------|--------|------------|
-| `pi-harvest/` (the extension) | Inspect `pi.dev` lifecycle events, write to `.pi/harvest/*.jsonl`, call the verifier API | Touch the user's source files directly outside the steer — no `git reset`, no auto-revert. The extension *steers*; the worker *writes*. |
+| `pi-harvest/` (the extension) | Inspect `pi.dev` lifecycle events, write to `.pi/harvest/*.jsonl` + `harvest.db` + `settings.json`, call the verifier API | Touch the user's source files directly outside the steer — no `git reset`, no auto-revert. The extension *steers*; the worker *writes*. |
 | `pi-harvest/` | Read environment variables (`VERIFIER_API_KEY`, `VERIFIER_BASE_URL`, `VERIFIER_MODEL`) | Hardcode API keys, base URLs, or model IDs in source. |
 | `pi-harvest/` | Subscribe to `tool_result`, `turn_end` | Subscribe to events that fire mid-generation — we only act on completed turns and finished tool calls. |
 
@@ -213,7 +241,7 @@ When the parent session dispatches a subagent via `@tintinweb/pi-subagents` (or 
 - **Hooks fire per-session, not globally.** Each subagent runs in its own `AgentSession` with its own `ExtensionRunner`. pi-harvest's `pi.on("tool_result")` and `pi.on("turn_end")` registrations land on the subagent's runner, so a 3-streak compiler failure inside a subagent triggers an audit *in that subagent's session*, not the parent's. This is the right behavior: the verifier should audit the worker that's drifting.
 - **State is per-subagent.** `compilerFailStreak` and `turnCounter` are module-locals in `src/index.ts`. Each subagent gets its own counter pair. The parent's UI shows only the parent's counters; subagent counters live in each subagent's UI context (`ctx.ui` is session-scoped).
 - **Status widget split.** `[Harvester] Turn: N | Streak: M` renders in whichever session currently owns the UI. Subagent sessions show their own widget; the parent won't see subagent streaks unless bridged via `pi.events` (`subagents:created/started/completed/failed/steered/compacted`).
-- **Shared sink, concurrent writers.** `.pi/harvest/trajectories.jsonl` is filesystem-shared. Parent + N subagents all append to the same JSONL. Append-only design tolerates it; the DPO pipeline downstream must accept multi-session provenance per file. A `sessionId` field on each record is deferred to Phase 5.
+- **Shared sink, concurrent writers.** `.pi/harvest/trajectories.jsonl` and `harvest.db` are filesystem-shared. Parent + N subagents all append to the same JSONL and mirror into the same SQLite DB. Append-only + `INSERT OR IGNORE` tolerate it; the DB uses WAL and a 5s `busy_timeout` to absorb short write contention. The DPO pipeline downstream must accept multi-session provenance per file.
 - **`isolated: true` opts out by design.** Any subagent marked `isolated: true` in its agent config gets `extensions: false` per pi-subagents' isolation semantics — pi-harvest is silently skipped there. This matches pi-subagents' intent and is not a bug.
 - **Default load.** All built-in pi-subagents agents (`general-purpose`, `Explore`, `Plan`, `statusline-setup`) declare `extensions: true` — meaning all parent-session extensions (including pi-harvest) load into the subagent by default. No opt-in needed for the common case.
 - **`/harvest` command availability.** The slash command registers per-session. It works inside any subagent session that has pi-harvest loaded; the resulting audit + splice operate on that subagent's own chat context.
@@ -226,13 +254,15 @@ If subagent-aware aggregation is ever needed (parent UI shows aggregate streak a
 
 | Phase | Status | What ships |
 |-------|--------|------------|
-| **Phase 1** ✅ | Done | Scaffold, hooks, TUI status widget, `npm publish` pipeline, smoke test. `turn_end` + `tool_result` fire `ctx.ui.notify()` on trigger. |
-| **Phase 2** | Next | `verifier/client.ts` — POST to K3/DeepSeek, parse JSON schema. Replace `notify()` with a real audit call. |
-| **Phase 3** | Planned | `slice/engine.ts` — backward-traverse session, find inception prompt, snapshot active files. |
-| **Phase 4** | Planned | `splice/engine.ts` — `ctx.sessionManager.prune(...)` + `pi.sendMessage(..., {deliverAs: "steer"})`. |
-| **Phase 5** | Planned | `sink/jsonl.ts` — append `.pi/harvest/trajectories.jsonl`. Pair `chosen` (next-pass worker) with `rejected` (pre-steer). |
-| **Phase 6** | Planned | `commands/audit.ts` — manual `/k3-audit` slash command. Status widget polish. |
-| **Phase 7+** | Out of scope | Periodic audit opt-in, multi-verifier consensus, auto-DPO conversion script. |
+| **Phase 1** ✅ | Done | Scaffold, hooks, TUI status widget, `npm publish` pipeline, smoke test. |
+| **Phase 2** ✅ | Done | Verifier client — POST to K3/DeepSeek, JSON-schema-validated audit. |
+| **Phase 3** ✅ | Done | Neat Slice engine — backward traversal, inception prompt, active-file snapshots. |
+| **Phase 4** ✅ | Done | Splice — rewind via `navigateTree`, steer injection, monthly JSONL rotation, `git diff` capture, `/harvest export`. |
+| **Phase 5** ✅ | Done | Thrashing detection → trajectory distillation DPO pairs. |
+| **Phase 6** ✅ | Done | `/harvest status | audit | rewind | review | opinion | export`, telemetry. |
+| **Phase 7** ✅ | Done | Zero-shot SFT golden mining + `sft_golden_*.jsonl` sink + `/harvest export sft`. |
+| **Phase 8** ✅ | Done | `node:sqlite` mirror (`harvest.db`) with automatic JSONL migration and hash dedupe; persistent `<harvestRoot>/settings.json`; interactive `/harvest-settings` registry-backed supervisor picker. |
+| **Phase 9+** | Out of scope | Periodic audit opt-in, multi-verifier consensus, auto-DPO conversion script. |
 
 After Phase 5: `prepare_dpo_dataset.py` (per the plan's offline parser) converts `trajectories.jsonl` into the Hugging Face conversational DPO format for downstream Unsloth fine-tuning of Qwen2.5-Coder-32B.
 
@@ -275,7 +305,7 @@ If a phase requires a **foundational** decision (e.g. "should we add SQLite alon
 ### No-touch zones
 
 - ❌ **`dist/`** — generated by `tsc`. Never hand-edit. If `dist/` is dirty, `rm -rf dist && npm run build`.
-- ❌ **`.pi/`** — pi runtime state + (eventually) the harvest sink. Never commit; never clean without asking the user (the harvested trajectories are the whole point of this extension).
+- ❌ **`.pi/`** — pi runtime state + the harvest sinks (`*.jsonl`, `harvest.db`, `settings.json`). Never commit; never clean without asking the user (the harvested trajectories are the whole point of this extension). `settings.json` may contain a supervisor API key — treat it like `.env`.
 - ❌ **`.env`** — gitignored. If you need to verify env vars are set, ask the user to confirm; never echo them back into logs.
 
 ### Forbidden operations

@@ -28,6 +28,8 @@
 
 import { appendFileSync, mkdirSync, statSync, existsSync, createReadStream } from "node:fs";
 import { resolveHarvestRoot, ensureHarvestRoot } from "./paths.js";
+import { insertDpoRecord, insertSftRecord } from "./db.js";
+import { resolveSupervisorIdentity } from "./config.js";
 import { join, basename } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -104,6 +106,10 @@ export function listSftFiles(_cwd?: string): string[] {
 /**
  * Append one GoldenSFTRecord as a JSONL line to the active month's
  * SFT Golden sink. Creates the directory if missing.
+ *
+ * Also mirrors the record into `<harvestRoot>/harvest.db` (SQLite) when
+ * `node:sqlite` is available. The mirror is best-effort: a locked or
+ * unavailable DB must never break the JSONL capture path.
  */
 export function appendGoldenSFT(_cwd: string | undefined, record: GoldenSFTRecord, now: Date = new Date()): SinkResult {
  const dir = ensureHarvestRoot();
@@ -111,6 +117,11 @@ export function appendGoldenSFT(_cwd: string | undefined, record: GoldenSFTRecor
  const filePath = currentSftSinkPath(undefined, now);
  const line = JSON.stringify(record) + "\n";
  appendFileSync(filePath, line, { encoding: "utf8" });
+ try {
+ insertSftRecord(record, "live_golden");
+ } catch {
+ // SQLite mirror is optional; never fail the write.
+ }
  return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };
 }
 
@@ -198,6 +209,10 @@ export function buildTrajectoryRecord(args: {
 /**
  * Append a single JSONL line to the active month's sink.
  * Creates the directory if missing (recursive).
+ *
+ * Also mirrors the record into `<harvestRoot>/harvest.db` (SQLite) and
+ * promotes its resolved completion into `sft_records`. The mirror is
+ * best-effort and never blocks the JSONL write.
  */
 export function writeTrajectoryRecord(
  record: HarvestedTrajectoryRecord,
@@ -209,6 +224,11 @@ export function writeTrajectoryRecord(
  const filePath = currentSinkPath(undefined, now);
  const line = JSON.stringify(record) + "\n";
  appendFileSync(filePath, line, { encoding: "utf8" });
+ try {
+ insertDpoRecord(record);
+ } catch {
+ // SQLite mirror is optional; never fail the write.
+ }
  return { path: filePath, bytes: Buffer.byteLength(line, "utf8") };
 }
 
@@ -237,7 +257,7 @@ export function writeDpoEntry(args: {
  chosenCompletion: args.chosenCompletion,
  rejectedCompletion: args.rejectedCompletion,
  workerModel: args.workerModel ?? "unknown",
- verifierModel: args.verifierModel ?? (process.env.VERIFIER_MODEL ?? "unknown"),
+ verifierModel: args.verifierModel ?? (resolveSupervisorIdentity().model || "unknown"),
  triggerReason: args.triggerReason ?? "compiler_streak",
  divergenceEntryId: args.divergenceEntryId ?? null,
  domainTags: args.domainTags ?? args.audit.domain_tags ?? [],

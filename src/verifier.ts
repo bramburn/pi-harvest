@@ -9,7 +9,8 @@
  */
 
 import type { NeatSlice, VerifierAudit, ActiveFile } from "./types.js";
-import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
+import { VerifierUnavailableError } from "./types.js";
+import { resolveSupervisorConfig } from "./config.js";
 import { buildVerifierPayload } from "./slice.js";
 
 const REQUIRED_FIELDS: (keyof VerifierAudit)[] = [
@@ -43,28 +44,22 @@ const SYSTEM_PROMPT = [
  "Return JSON only. Do not wrap it in markdown fences. Do not add prose.",
 ].join("\n");
 
-function readEnv(): { baseUrl: string; apiKey: string; model: string; timeoutMs: number; retries: number } {
- const baseUrl = process.env.VERIFIER_BASE_URL?.replace(/\/+$/, "") ?? "";
- const apiKey = process.env.VERIFIER_API_KEY ?? "";
- const model = process.env.VERIFIER_MODEL ?? "";
- const timeoutMs = Number(process.env.HARVEST_TIMEOUT_MS ?? "300000");
- const retries = Number(process.env.HARVEST_MAX_RETRIES ?? "2");
- // Missing required env vars throw VerifierConfigError (not a bare
- // Error) so callers can distinguish "the verifier is down" from
- // "the verifier isn't configured yet" and surface a helpful hint
- // instead of a misleading "after retries" error message.
- const missing: string[] = [];
- if (!baseUrl) missing.push("VERIFIER_BASE_URL");
- if (!apiKey) missing.push("VERIFIER_API_KEY");
- if (!model) missing.push("VERIFIER_MODEL");
- if (missing.length > 0) throw new VerifierConfigError(missing);
- if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
- throw new VerifierConfigError(["HARVEST_TIMEOUT_MS (must be a positive number)"]);
- }
- if (!Number.isFinite(retries) || retries < 0) {
- throw new VerifierConfigError(["HARVEST_MAX_RETRIES (must be >= 0)"]);
- }
- return { baseUrl, apiKey, model, timeoutMs, retries };
+/**
+ * Resolve the supervisor endpoint for a call.
+ *
+ * Configuration precedence lives in ./config.ts: settings.json (written
+ * by /harvest-settings) -> pi's model registry -> VERIFIER_* env vars ->
+ * provider defaults. Pass the active `ctx` whenever you have one so
+ * registry-held credentials can be used without copying them on disk.
+ */
+async function readConfig(ctx?: unknown): Promise<{
+ baseUrl: string;
+ apiKey: string;
+ model: string;
+ timeoutMs: number;
+ retries: number;
+}> {
+ return resolveSupervisorConfig(ctx);
 }
 
 /**
@@ -416,8 +411,8 @@ export async function invokeDistiller(opts: {
  cwd: string;
  slice: NeatSlice;
  activeFiles: ActiveFile[];
-}): Promise<DistillerResponse> {
- const env = readEnv();
+}, ctx?: unknown): Promise<DistillerResponse> {
+ const env = await readConfig(ctx);
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -442,8 +437,8 @@ export async function invokeDistiller(opts: {
  * Send the neat slice to the Verifier and parse the strict JSON response,
  * with exponential backoff on retryable failures.
  */
-export async function invokeVerifier(slice: NeatSlice): Promise<VerifierAudit> {
- const env = readEnv();
+export async function invokeVerifier(slice: NeatSlice, ctx?: unknown): Promise<VerifierAudit> {
+ const env = await readConfig(ctx);
  const opts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -616,8 +611,8 @@ export async function invokeReviewer(opts: {
  slice: NeatSlice;
  activeFiles: ActiveFile[];
  humanFeedback: string;
-}): Promise<ReviewerResponse> {
- const env = readEnv();
+}, ctx?: unknown): Promise<ReviewerResponse> {
+ const env = await readConfig(ctx);
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;
@@ -792,8 +787,8 @@ export async function invokeOpinion(opts: {
  slice: NeatSlice;
  activeFiles: ActiveFile[];
  optionalQuery: string;
-}): Promise<OpinionResponse> {
- const env = readEnv();
+}, ctx?: unknown): Promise<OpinionResponse> {
+ const env = await readConfig(ctx);
  const envOpts = { baseUrl: env.baseUrl, apiKey: env.apiKey, model: env.model, timeoutMs: env.timeoutMs };
  const backoffMs = [1000, 2000];
  let lastError: unknown = null;

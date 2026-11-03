@@ -54,8 +54,19 @@
  *     call already paid for the content).
  */
 
-import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords } from "./sink.js";
+import { writeDpoEntry, getSinkStats, currentSinkPath, appendGoldenSFT, currentSftSinkPath, countSftRecords, listSinkFiles, listSftFiles } from "./sink.js";
 import { migrateLegacyHarvest } from "./paths.js";
+import {
+ getSettingsPath,
+ listRegistryModels,
+ loadSettings,
+ providerDefaultBaseUrl,
+ providerEnvKeyPresent,
+ resolveSupervisorConfig,
+ resolveSupervisorIdentity,
+ saveSettings,
+} from "./config.js";
+import { getDbStats, initDatabase, migrateJsonlToSqlite } from "./db.js";
 import { extractNeatSlice, messageToText, extractToolResultText, enforcePayloadSize } from "./slice.js";
 import { invokeVerifier, invokeDistiller, invokeReviewer, invokeOpinion } from "./verifier.js";
 import { performSplice, buildFilesLine, steerPrefix } from "./splice.js";
@@ -79,12 +90,18 @@ import { VerifierUnavailableError, VerifierConfigError } from "./types.js";
 interface UiHelpers {
  setStatus?(key: string, content: unknown): void;
  notify?(message: string, level?: string): void;
+ // Interactive dialogs (ExtensionUIContext). Present in interactive mode
+ // only; always feature-detect before use.
+ select?(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
+ input?(title: string, placeholder?: string, opts?: unknown): Promise<string | undefined>;
+ confirm?(title: string, message: string, opts?: unknown): Promise<boolean>;
 }
 
 interface PiContext {
  ui: UiHelpers;
  cwd: string;
  model?: { id?: string; name?: string; provider?: string } | undefined;
+ modelRegistry?: unknown;
  sessionManager: {
  getBranch(): SessionEntry[];
  getSessionId(): string;
@@ -222,6 +239,22 @@ export default function (pi: ExtensionAPI): void {
  migrateLegacyHarvest(process.cwd());
  } catch {
  // Never block extension startup on migration errors.
+ }
+
+ // Phase 9: initialise the SQLite mirror (dual-write alongside the JSONL
+ // sinks) and back-fill it from any JSONL captured before this version.
+ // Both steps are best-effort: node:sqlite is unavailable on Node < 22.13
+ // and a locked DB must never prevent the extension from loading.
+ try {
+ initDatabase();
+ const migrated = migrateJsonlToSqlite({ sftFiles: listSftFiles(), dpoFiles: listSinkFiles() });
+ if (migrated.dpoImported > 0 || migrated.sftImported > 0) {
+ console.error(
+ "[Harvester] SQLite migration: " + migrated.dpoImported + " DPO + " + migrated.sftImported + " SFT records imported",
+ );
+ }
+ } catch {
+ // node:sqlite missing or the DB is locked by another session.
  }
 
  let turnCounter = 0;
@@ -366,7 +399,7 @@ export default function (pi: ExtensionAPI): void {
  try {
  const branch = ctx.sessionManager.getBranch();
  const slice = extractNeatSlice(branch, ctx.cwd);
- const audit = await invokeVerifier(slice);
+ const audit = await invokeVerifier(slice, ctx);
 
  // Capture active files + git diff at audit time.
  let activeFiles: ActiveFile[] = [];
@@ -586,7 +619,7 @@ export default function (pi: ExtensionAPI): void {
  ctx,
  domainTags,
  workerModel: workerModelId(ctx),
- verifierModel: process.env.VERIFIER_MODEL ?? "unknown",
+ verifierModel: resolveSupervisorIdentity().model || "unknown",
  triggerReason: lastTriggerReason,
  divergenceEntryId: lastDivergenceEntryId,
  activeFiles: lastActiveFiles,
@@ -625,6 +658,236 @@ export default function (pi: ExtensionAPI): void {
  // Slash command: /harvest status | /harvest audit | /harvest export dpo
  // -------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------
+// Interactive settings: /harvest-settings | /harvest settings
+// -------------------------------------------------------------------------
+
+const SETTINGS_FILTER = "[🔍 Filter models by keyword...]";
+const SETTINGS_MANUAL_MODEL = "[✏️ Enter a model id manually...]";
+const SETTINGS_MAX_OPTIONS = 60;
+
+/** Persist a model choice and mirror it into the live process env. */
+async function applySupervisorModel(ctx: PiContext, provider: string, modelId: string): Promise<void> {
+ const baseUrl = providerDefaultBaseUrl(provider);
+ saveSettings({
+ supervisorProvider: provider,
+ supervisorModelId: modelId,
+ // Clear a stale endpoint/key from a previously selected model so the
+ // new provider isn't pointed at the old host.
+ supervisorBaseUrl: baseUrl,
+ supervisorApiKey: undefined,
+ });
+ process.env.VERIFIER_PROVIDER = provider;
+ process.env.VERIFIER_MODEL = modelId;
+ if (baseUrl) process.env.VERIFIER_BASE_URL = baseUrl;
+ else delete process.env.VERIFIER_BASE_URL;
+
+ try {
+ const cfg = await resolveSupervisorConfig(ctx);
+ notify(
+ ctx,
+ "Supervisor saved: " + provider + "/" + modelId + " @ " + cfg.baseUrl +
+ " (credentials: " + (loadSettings().supervisorApiKey ? "settings.json" : "registry/env") + ")",
+ "info",
+ );
+ } catch (err) {
+ notify(
+ ctx,
+ "Saved supervisor " + provider + "/" + modelId + ", but it is not usable yet: " + ((err as Error)?.message ?? String(err)),
+ "warn",
+ );
+ }
+ paint(ctx);
+}
+
+/**
+ * Registry-backed model picker. `ui.select` in pi is a plain arrow-key
+ * list (no fuzzy typing), so we layer keyword filtering on top with
+ * `ui.input` and re-render the shortened list.
+ *
+ * Returns true when the settings menu should close.
+ */
+async function pickSupervisorModel(ctx: PiContext, initialQuery: string): Promise<boolean> {
+ const ui = ctx.ui;
+ if (!ui?.select) return false;
+
+ const all = listRegistryModels(ctx);
+ if (all.length === 0) {
+ notify(
+ ctx,
+ "pi's model registry returned no models. Use the manual endpoint option instead, or pass a model id.",
+ "warn",
+ );
+ return false;
+ }
+
+ let filter = initialQuery;
+ for (;;) {
+ const needle = filter.trim().toLowerCase();
+ const pool = needle ? all.filter((o) => o.label.toLowerCase().includes(needle)) : all;
+ const shown = pool.slice(0, SETTINGS_MAX_OPTIONS);
+ const options: string[] = [SETTINGS_FILTER, SETTINGS_MANUAL_MODEL];
+ for (const o of shown) options.push(o.label);
+
+ let title = "Supervisor model — " + pool.length + " match" + (pool.length === 1 ? "" : "es");
+ if (pool.length > shown.length) title += " (showing " + shown.length + ", refine the filter for more)";
+ if (needle) title += " [filter: " + filter + "]";
+
+ const sel = await ui.select(title, options);
+ if (!sel) return false;
+
+ if (sel === SETTINGS_FILTER) {
+ const q = await ui.input?.("Filter models by keyword", "e.g. qwen, deepseek, kimi, coder", {});
+ if (q === undefined) continue;
+ filter = q.trim();
+ continue;
+ }
+
+ if (sel === SETTINGS_MANUAL_MODEL) {
+ const modelId = await ui.input?.("Model id (as sent to the API)", "e.g. deepseek-chat", {});
+ if (!modelId || modelId.trim().length === 0) continue;
+ const provider = await ui.input?.("Provider label (used for [STEER:<PROVIDER>] tags)", "e.g. deepseek", {});
+ if (!provider || provider.trim().length === 0) continue;
+ await applySupervisorModel(ctx, provider.trim().toLowerCase(), modelId.trim());
+ return true;
+ }
+
+ const picked = all.find((o) => o.label === sel);
+ if (!picked) continue;
+ await applySupervisorModel(ctx, picked.provider, picked.id);
+ return true;
+ }
+}
+
+/** Manually set base URL and/or API key for the current provider. */
+async function configureEndpoint(ctx: PiContext): Promise<boolean> {
+ const ui = ctx.ui;
+ if (!ui?.select) return false;
+ const current = loadSettings();
+ const identity = resolveSupervisorIdentity();
+
+ const choice = await ui.select("Configure supervisor endpoint", [
+ "Set base URL",
+ "Set API key (stored in settings.json)",
+ "Clear stored endpoint + API key",
+ "Cancel",
+ ]);
+ if (!choice || choice === "Cancel") return false;
+
+ if (choice === "Set base URL") {
+ const value = await ui.input?.(
+ "Supervisor base URL (OpenAI-compatible, without /chat/completions)",
+ current.supervisorBaseUrl || providerDefaultBaseUrl(identity.provider) || "https://api.deepseek.com/v1",
+ {},
+ );
+ if (value === undefined) return false;
+ const trimmed = value.trim();
+ saveSettings({ supervisorBaseUrl: trimmed.length > 0 ? trimmed : undefined });
+ if (trimmed.length > 0) process.env.VERIFIER_BASE_URL = trimmed;
+ notify(ctx, trimmed.length > 0 ? "Base URL saved: " + trimmed : "Stored base URL cleared", "info");
+ return true;
+ }
+
+ if (choice === "Set API key (stored in settings.json)") {
+ if (!ui.input) {
+ notify(ctx, "This pi build has no ui.input; set VERIFIER_API_KEY instead.", "warn");
+ return false;
+ }
+ const key = await ui.input("Supervisor API key (saved to settings.json, never logged)", "sk-...", {});
+ if (key === undefined) return false;
+ const trimmed = key.trim();
+ saveSettings({ supervisorApiKey: trimmed.length > 0 ? trimmed : undefined });
+ notify(
+ ctx,
+ trimmed.length > 0
+ ? "API key saved to " + getSettingsPath() + " (" + trimmed.length + " chars)"
+ : "Stored API key cleared; env/registry credentials will be used",
+ "info",
+ );
+ return true;
+ }
+
+ saveSettings({ supervisorBaseUrl: undefined, supervisorApiKey: undefined });
+ delete process.env.VERIFIER_BASE_URL;
+ notify(ctx, "Stored endpoint + API key cleared", "info");
+ return true;
+}
+
+/** Print the resolved supervisor + storage state. */
+function showConfiguration(ctx: PiContext): void {
+ const id = resolveSupervisorIdentity();
+ const s = loadSettings();
+ const db = getDbStats();
+ const lines = [
+ "Settings file: " + getSettingsPath(),
+ "Supervisor: " + (id.model ? id.provider + "/" + id.model : "<unset>") + " (source: " + id.source + ")",
+ "Base URL: " + (s.supervisorBaseUrl || process.env.VERIFIER_BASE_URL || providerDefaultBaseUrl(id.provider) || "<unset>"),
+ "API key: " + (s.supervisorApiKey ? "settings.json" : process.env.VERIFIER_API_KEY ? "VERIFIER_API_KEY" : providerEnvKeyPresent(id.provider) ? "provider env var" : "model registry / <unset>"),
+ "SQLite: " + db.dbPath + " sft=" + db.sftCount + " dpo=" + db.dpoCount + (db.available ? "" : " (unavailable: " + (db.error ?? "node:sqlite missing") + ")"),
+ ];
+ for (const line of lines) notify(ctx, line, "info");
+}
+
+/** Import rotated JSONL files into the SQLite mirror. */
+function syncJsonlToSqlite(ctx: PiContext): void {
+ try {
+ const result = migrateJsonlToSqlite({ sftFiles: listSftFiles(ctx.cwd), dpoFiles: listSinkFiles(ctx.cwd) });
+ notify(
+ ctx,
+ "SQLite sync: dpo " + result.dpoImported + " new / " + result.dpoScanned + " scanned, sft " +
+ result.sftImported + " new / " + result.sftScanned + " scanned → " + getDbStats().dbPath,
+ "info",
+ );
+ } catch (err) {
+ notify(ctx, "SQLite sync failed: " + ((err as Error)?.message ?? String(err)), "warn");
+ }
+}
+
+/** `/harvest-settings [query]` — interactive supervisor + storage config. */
+async function runHarvestSettings(ctx: PiContext, rawArgs: string): Promise<void> {
+ const ui = ctx.ui;
+ const query = (rawArgs ?? "").trim();
+
+ if (!ui?.select) {
+ // Headless / test / subagent contexts: report rather than prompt.
+ showConfiguration(ctx);
+ return;
+ }
+
+ if (query.length > 0) {
+ await pickSupervisorModel(ctx, query);
+ return;
+ }
+
+ for (;;) {
+ const choice = await ui.select("Harvester Settings", [
+ "Supervisor model (search & select)",
+ "Supervisor endpoint / API key",
+ "Sync JSONL files into SQLite",
+ "View current configuration",
+ "Cancel",
+ ]);
+ if (!choice || choice === "Cancel") {
+ return;
+ }
+ if (choice === "Supervisor model (search & select)") {
+ if (await pickSupervisorModel(ctx, "")) return;
+ continue;
+ }
+ if (choice === "Supervisor endpoint / API key") {
+ if (await configureEndpoint(ctx)) return;
+ continue;
+ }
+ if (choice === "Sync JSONL files into SQLite") {
+ syncJsonlToSqlite(ctx);
+ continue;
+ }
+ if (choice === "View current configuration") {
+ showConfiguration(ctx);
+ continue;
+ }
+ }
+}
  pi.registerCommand("harvest", {
  description: "pi-harvest controls. Subcommands: status | audit | retry | rewind | review <feedback> | opinion [query] | export [dpo|sft]",
  handler: async (args, ctx) => {
@@ -633,6 +896,11 @@ export default function (pi: ExtensionAPI): void {
  const c = ctx as PiContext;
 
  // Subcommand routing.
+ if (trimmed === "settings" || trimmed === "config") {
+ await runHarvestSettings(c, rawArgs.replace(/^(settings|config)\s*/i, ""));
+ return;
+ }
+
  if (trimmed === "audit") {
  if (auditInFlight) {
  notify(c, "Audit already in flight", "warn");
@@ -771,11 +1039,15 @@ export default function (pi: ExtensionAPI): void {
  " state=" +
  state +
  (lastAuditedTurn > 0 ? " lastAudit=" + lastAuditedTurn : "");
+ const supervisor = resolveSupervisorIdentity();
+ const settings = loadSettings();
+ const dbStats = getDbStats();
  const line2 =
  "Verifier: " +
- (process.env.VERIFIER_BASE_URL || "<unset>") +
+ (settings.supervisorBaseUrl || process.env.VERIFIER_BASE_URL || providerDefaultBaseUrl(supervisor.provider) || "<unset>") +
  " model=" +
- (process.env.VERIFIER_MODEL || "<unset>");
+ (supervisor.model || "<unset>") +
+ " (" + supervisor.source + ")";
  const line3 =
  "Sink: " +
  stats.path +
@@ -789,11 +1061,39 @@ export default function (pi: ExtensionAPI): void {
  const line4 = "SFT: " + sftPath + " records=" + sftCountOnDisk;
  const line5 = "Worker: " + workerModelId(c);
  const line6 = formatTelemetryForNotify(telemetry);
+ const lineSettings = "Settings: " + getSettingsPath() + " (/harvest-settings)";
+ const lineDb =
+ "SQLite: " +
+ dbStats.dbPath +
+ " sft=" +
+ dbStats.sftCount +
+ " dpo=" +
+ dbStats.dpoCount +
+ (dbStats.available ? "" : " (unavailable: " + (dbStats.error ?? "node:sqlite missing") + ")");
  const line7 = lastError
  ? "LastError: " + lastError.source + " @ " + lastError.ts + " - " + lastError.message + " (run /harvest audit to retry)"
  : "LastError: (none)";
- c.ui?.notify?.("[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n " + line5 + "\n" + line6 + "\n " + line7, "info");
+ c.ui?.notify?.(
+ "[Harvester]\n " + line1 + "\n " + line2 + "\n " + line3 + "\n " + line4 + "\n " + line5 + "\n " + lineSettings + "\n " + lineDb + "\n" + line6 + "\n " + line7,
+ "info",
+ );
  paint(c);
+ },
+ });
+
+ // -------------------------------------------------------------------------
+ // Slash command: /harvest-settings [query]
+ // -------------------------------------------------------------------------
+
+ pi.registerCommand("harvest-settings", {
+ description: "Configure the pi-harvest supervisor model / endpoint and SQLite mirror. Optional keyword filters the model list.",
+ handler: async (args, ctx) => {
+ const c = ctx as PiContext;
+ try {
+ await runHarvestSettings(c, args ?? "");
+ } catch (err) {
+ notify(c, "Settings failed: " + ((err as Error)?.message ?? String(err)), "warn");
+ }
  },
  });
 
@@ -1036,7 +1336,7 @@ export default function (pi: ExtensionAPI): void {
  activeFiles = [];
  }
 
- const review = await invokeReviewer({ cwd: c.cwd, slice, activeFiles, humanFeedback });
+ const review = await invokeReviewer({ cwd: c.cwd, slice, activeFiles, humanFeedback }, c);
 
  // Stage the audit so the existing maybeResolveAndHarvest() can pick it up.
  lastAudit = {
@@ -1176,7 +1476,7 @@ export default function (pi: ExtensionAPI): void {
  activeFiles = [];
  }
 
- const opinion = await invokeOpinion({ cwd: c.cwd, slice, activeFiles, optionalQuery });
+ const opinion = await invokeOpinion({ cwd: c.cwd, slice, activeFiles, optionalQuery }, c);
 
  // Stage the audit so the existing maybeResolveAndHarvest() can pick it up.
  lastAudit = {
@@ -1257,7 +1557,7 @@ export default function (pi: ExtensionAPI): void {
  distillationInFlight = (async () => {
  try {
  const activeFiles = await captureActiveFileStates(c.cwd, slice.modifiedPaths);
- const distilled = await invokeDistiller({ cwd: c.cwd, slice, activeFiles });
+ const distilled = await invokeDistiller({ cwd: c.cwd, slice, activeFiles }, c);
  writeDpoEntry({
  audit: {
  inferred_subtask: "thrashing_distillation",
@@ -1274,7 +1574,7 @@ export default function (pi: ExtensionAPI): void {
  ctx: c,
  domainTags: inferDomainTags(slice.modifiedPaths),
  workerModel: workerModelId(c),
- verifierModel: process.env.VERIFIER_MODEL ?? "unknown",
+ verifierModel: resolveSupervisorIdentity().model || "unknown",
  triggerReason: "thrashing_distillation",
  divergenceEntryId: null,
  activeFiles,

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          # Windows is in the matrix on purpose: the SQLite mirror and the
+          # JSONL sinks are both sensitive to file-lock semantics, and every
+          # EBUSY regression we have hit was Windows-only.
+          - os: windows-latest
+            node: 24
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install (lockfile-exact)
+        run: npm ci
+
+      - name: Build (tsc, strict)
+        run: npm run build
+
+      - name: Unit tests (node:test over dist/)
+        run: npm test
+
+      - name: Integration smoke test
+        run: npm run smoke
+
+      - name: Verify the publishable tarball
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        run: npm pack --dry-run

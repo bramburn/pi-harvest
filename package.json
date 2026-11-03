@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/paths.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts test/splice.test.ts",
+    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/slice.test.ts test/workspace.test.ts test/sink.test.ts test/paths.test.ts test/verifier.test.ts test/exporter.test.ts test/telemetry.test.ts test/splice.test.ts test/config.test.ts test/db.test.ts",
     "smoke": "npm run build && node tests/smoke.js",
     "prepublishOnly": "npm run build && npm test && npm run smoke"
   },
@@ -27,6 +27,9 @@
   "author": "bramburn",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": ["./dist/index.js"]
   }
 }

@@ -1,8 +1,11 @@
 # pi-harvest
 
+[![CI](https://github.com/bramburn/pi-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/bramburn/pi-harvest/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-harvest)](https://www.npmjs.com/package/pi-harvest)
+
 > Trajectory harvester for [`pi.dev`](https://pi.dev) — watches local worker runs, intercepts compile-failure loops, audits them with an out-of-band verifier, captures active-file context, ships monthly-rotated DPO/SFT records, and distills multi-turn thrashing into optimal 1-turn training pairs.
 
-`pi-harvest` is a `pi.dev` extension with five phases:
+`pi-harvest` is a `pi.dev` extension with a phased feature set:
 
 - **Phase 1 — telemetry.** Bash-output compiler-failure scanning, TUI status widget, warn-level notifications when thresholds trip.
 - **Phase 2 — Neat Slice + audit + splice + DPO sink.** Threshold trip → extract *Neat Slice* → POST to OpenAI-compatible Verifier → rewind via `navigateTree` → inject `[STEER:K3]` → write DPO JSONL on resolution.
@@ -10,6 +13,7 @@
 - **Phase 4 — data lifecycle + diff-awareness + native export.** Monthly sink rotation (`trajectories_YYYY_MM.jsonl`), `git diff --unified=3` capture (200-line clamp), `/harvest export dpo` slash command that streams every sink into a HuggingFace conversational DPO file under `.pi/harvest/exports/dpo_dataset_YYYY_MM_DD.jsonl`, top-3 flaw-category telemetry in `/harvest status`.
 - **Phase 5 — Trajectory Distillation (Thrashing Detection).** When the worker spends 6+ tool calls in a single turn and repeatedly edits the same files before producing a clean compile, the extension fires a background distillation call (does NOT pause the user). K3 is asked to write the optimal single-turn response that achieves the same result; the rejected text (the messy multi-turn thrash) and the K3-distilled chosen text are saved as a DPO pair with `trigger_reason: "thrashing_distillation"`.
 - **Phase 6 — Semantic Quality Audits.** `/harvest review <feedback>` slash command. The user types feedback (e.g. "you forgot to hoist the drawer state to ViewModel"); the extension captures slice + active files, sends them to the Verifier (Staff Engineer prompt mode) which returns a diagnosis + steering instructions, prunes the flawed turn via `navigateTree`, and injects a `[SEMANTIC REVIEW ALERTS]` steering message. On clean resolution, the DPO pair is written with `trigger_reason: "semantic_review"` and the original human feedback preserved in `human_feedback`.
+- **Phase 9 — SQLite mirror + persistent settings.** Every JSONL record is dual-written into <harvestRoot>/harvest.db via Node's built-in `node:sqlite` (zero npm deps, hash-deduped, WAL). Existing JSONL sinks are migrated automatically on startup. Supervisor configuration persists in <harvestRoot>/settings.json and is editable through the interactive `/harvest-settings` picker.
 - **Phase 7 — Zero-Shot Success Mining (SFT Golden Data).** Passive capture of *flawless* trajectories. When the worker completes a task in 1–2 turns with no compile failures and no audit in flight, the extension silently extracts the user prompt + active files + git diff + the worker's successful completion and writes them to a separate sink `<cwd>/.pi/harvest/sft_golden_YYYY_MM.jsonl`. **Zero verifier LLM calls.** Convert to a standard Hugging Face `SFTTrainer`-compatible file with `/harvest export sft`. This is the *positive* training signal that complements all the DPO `rejected_completion`s.
 
 ## TUI widget
@@ -104,6 +108,8 @@ idle ──(threshold trips)──▶ auditing ──(success)──▶ awaiting
 | `HARVEST_TIMEOUT_MS` | no | `30000` (per-attempt) |
 | `HARVEST_MAX_RETRIES` | no | `2` (backoff `1s → 2s`) |
 
+Resolution order: `<harvestRoot>/settings.json` → pi's model registry → these env vars → provider defaults (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, ...). Env vars are still the zero-config path; `/harvest-settings` writes the same values to `settings.json` interactively.
+
 **Schema** (fence stripping automatic):
 
 ```json
@@ -184,9 +190,14 @@ Schema (`HarvestedTrajectoryRecord`):
 # From npm
 pi install npm:pi-harvest
 
-# From a local checkout
+# From a local checkout (build first: pi loads ./dist/index.js)
+npm run build
 pi install C:\dev\pi-harvest -l --approve
 ```
+
+Requires **Node >= 22.19** (pi's own floor) and npm >= 11.5.1 only if you publish.
+The SQLite mirror uses Node's built-in `node:sqlite`; on older runtimes the
+extension still works and simply reports `SQLite: ... (unavailable)`.
 
 ## Uninstallation
 
@@ -200,9 +211,9 @@ pi uninstall pi-harvest
 git clone https://github.com/bramburn/pi-harvest
 cd pi-harvest
 npm install
-npm test      # 78 unit tests across slice/workspace/sink/verifier/exporter/telemetry
-npm run smoke # full Phase 2 + 3 + 4 integration test
-npm run build # tsc → dist/
+npm test      # 176 unit tests (slice/workspace/sink/paths/verifier/exporter/telemetry/splice/config/db)
+npm run smoke # full integration test (audit -> splice -> resolve -> export -> SQLite -> settings)
+npm run build # tsc -> dist/ (requires Node >= 22.19 for node:sqlite)
 ```
 
 ## Architecture
@@ -215,16 +226,20 @@ src/
 ├── verifier.ts     invokeVerifier() — POST chat/completions, retries on 429/5xx (1s→2s), strict JSON, fence stripping
 ├── splice.ts       performSplice() — navigateTree (rewind) + sendUserMessage (steering)
 ├── sink.ts         currentSinkPath() + listSinkFiles() + buildTrajectoryRecord() + writeTrajectoryRecord() + countRecords() + getSinkStats()
-├── exporter.ts     (NEW) mapRecordToHfDpo() + exportToHuggingFaceDPO() — streaming line-by-line converter
-├── telemetry.ts    (NEW) aggregateTelemetry() + formatTelemetryForNotify() — streaming top-N flaw counts
-└── index.ts        Extension entry — hooks, state machine, /harvest command, TUI widget
+├── exporter.ts mapRecordToHfDpo() + exportToHuggingFaceDPO() — streaming converter, JSONL + SQLite, hash-deduped
+├── telemetry.ts aggregateTelemetry() + formatTelemetryForNotify() — streaming top-N flaw counts
+├── config.ts loadSettings() + saveSettings() + resolveSupervisorConfig() — settings.json + registry/env precedence
+├── db.ts node:sqlite mirror: initDatabase() + insertDpoRecord() + insertSftRecord() + migrateJsonlToSqlite() + getDbStats()
+└── index.ts Extension entry — hooks, state machine, /harvest + /harvest-settings commands, TUI widget
 test/
-├── slice.test.ts       16 tests
-├── workspace.test.ts   17 tests (incl. git-diff failure modes)
-├── sink.test.ts        22 tests (incl. Phase 4 rotation + back-compat)
-├── verifier.test.ts    11 tests
-├── exporter.test.ts    7 tests
-└── telemetry.test.ts   7 tests
+├── slice.test.ts 23 tests
+├── workspace.test.ts 19 tests (incl. git-diff failure modes)
+├── sink.test.ts 25 tests (incl. Phase 4 rotation + back-compat)
+├── verifier.test.ts 45 tests
+├── exporter.test.ts 15 tests
+├── telemetry.test.ts 7 tests
+├── config.test.ts 14 tests (settings round-trip, precedence, VerifierConfigError, registry)
+└── db.test.ts 10 tests (schema, dedupe, SFT promotion, migration, graceful degradation)
 tests/
 └── smoke.js        Integration test — mocked pi runtime + mocked verifier HTTP, exercises audit/splice/resolve and /harvest status + /harvest audit + /harvest export dpo
 ```
@@ -334,6 +349,51 @@ Each output line is in the standard Hugging Face conversational SFT shape consum
 
 A dataset balanced 50/50 between DPO pairs (mistakes + corrections) and SFT goldens (clean examples) gives a downstream fine-tune both the **negative** signal (what to avoid) and the **positive** signal (what to imitate). The worker model's actual style — domain choices, comment density, error-handling patterns — is most faithful in the goldens because nothing was rejected and nothing was steered.
 
+## Phase 9: SQLite mirror + persistent settings
+
+### Why a second store
+
+JSONL is the canonical, append-only capture log — diff-able, cheap, and impossible to corrupt into unreadability. It is also terrible at `SELECT ... WHERE flaw_category = 'logic_error' AND timestamp > ...`, which is exactly what a training-data pipeline wants. So every record is written **twice**:
+
+1. `.pi/harvest/trajectories_YYYY_MM.jsonl` (DPO) and `.pi/harvest/sft_golden_YYYY_MM.jsonl` (SFT) — unchanged, first.
+2. `.pi/harvest/harvest.db` — the mirror, inside a `try/catch`.
+
+Tables: `dpo_records` (full audit triplet) and `sft_records` (one `messages_json` column already shaped for `SFTTrainer`). When a DPO episode resolves, its `chosen_completion` is also promoted into `sft_records` with `source = dpo_<trigger_reason>` — supervisor-corrected code is the highest-value SFT signal we have.
+
+**Dedupe:** each row carries a SHA-256 `record_hash` over the fields that define the pair and inserts use `INSERT OR IGNORE`. The exporter merges JSONL + SQLite with the same hash, so `/harvest export dpo` reports each record exactly once even though it exists on disk twice.
+
+**Implementation notes:**
+
+- `node:sqlite` (`DatabaseSync`) is loaded with a lazy `require`, so an older Node degrades to "SQLite unavailable" instead of crashing the extension. No npm package, no native build, no `node-gyp`.
+- The connection is opened and closed **per operation**. A cached handle makes Windows `rm -rf` / `git clean` / test cleanup fail with `EBUSY` and holds locks across subagent sessions. Cost is ~1ms.
+- `PRAGMA journal_mode = WAL` + `busy_timeout = 5000` keep parent and subagent writers from blocking each other.
+- On startup, `migrateJsonlToSqlite()` imports every rotated JSONL file into the DB. It is idempotent — re-running imports zero rows.
+
+```sql
+-- What the mirror buys you:
+SELECT flaw_category, COUNT(*) FROM dpo_records GROUP BY 1 ORDER BY 2 DESC;
+SELECT immediate_prompt, chosen_completion FROM sft_records WHERE timestamp > '2026-01-01';
+```
+
+### Persistent settings + `/harvest-settings`
+
+Supervisor configuration is stored in `<harvestRoot>/settings.json` (mode `0600`), so it survives restarts and subagents without exporting env vars. Resolution precedence:
+
+1. `settings.json` (`supervisorProvider`, `supervisorModelId`, `supervisorBaseUrl`, `supervisorApiKey`)
+2. pi's model registry (`ctx.modelRegistry` — picks up `baseUrl` + stored credentials)
+3. `VERIFIER_PROVIDER` / `VERIFIER_MODEL` / `VERIFIER_BASE_URL` / `VERIFIER_API_KEY`
+4. Provider defaults (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, … + documented base URLs)
+
+```
+/harvest-settings            # interactive menu
+/harvest-settings qwen       # pre-filter the model list
+/harvest settings            # alias under the /harvest namespace
+```
+
+The menu covers: pick a supervisor model from pi's registry (keyword filter → select), set a custom base URL, set/clear a stored API key, sync JSONL → SQLite, and print the resolved configuration. pi's `ui.select` is a plain arrow-key list, so the search is implemented as a `[🔍 Filter models by keyword…]` entry that re-renders the list via `ui.input`; a manual model-id + provider entry is always available as an escape hatch. Headless/subagent contexts print the configuration instead of prompting.
+
+The API key is **never** copied into `process.env` or logged; `settings.json` is its only home. Treat that file like `.env` — it is inside `.pi/`, which is gitignored.
+
 ## Roadmap
 
 - **Phase 1** ✅ — scaffolding, hooks, status widget, publishing pipeline.
@@ -344,6 +404,7 @@ A dataset balanced 50/50 between DPO pairs (mistakes + corrections) and SFT gold
 - **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
 - **Phase 7** ✅ — zero-shot success mining (SFT Golden Data).
 - **Phase 8** ✅ — proactive architectural opinions via `/harvest opinion [query]`.
+- **Phase 9** ✅ — `node:sqlite` mirror (`harvest.db`), automatic JSONL migration, persistent `settings.json`, `/harvest-settings` interactive picker.
 
 ## Phase 6: `/harvest review <feedback>` in detail
 
@@ -430,6 +491,25 @@ Same retry/backoff policy as the error auditor (`HARVEST_MAX_RETRIES`, 1 s → 2
 - **Phase 6** ✅ — semantic review via `/harvest review <feedback>`.
 - **Phase 7** ✅ — zero-shot success mining (SFT Golden Data).
 - **Phase 8** ✅ — proactive architectural opinions via `/harvest opinion [query]`.
+- **Phase 9** ✅ — `node:sqlite` mirror (`harvest.db`), automatic JSONL migration, persistent `settings.json`, `/harvest-settings` interactive picker.
+
+## CI / CD
+
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| `.github/workflows/ci.yml` | push to `main`, every PR, manual | Ubuntu (Node 22 + 24) and Windows (Node 24): `npm ci` -> `npm run build` -> `npm test` -> `npm run smoke` -> `npm pack --dry-run`. Windows is in the matrix on purpose — the SQLite/JSONL sinks are sensitive to file-lock semantics. |
+| `.github/workflows/publish.yml` | GitHub **release published**, manual | Builds + tests via `prepublishOnly`, verifies the tag matches `package.json`, skips already-published versions, then publishes with **npm trusted publishing (OIDC)** and provenance. No `NPM_TOKEN` secret. Manual runs take `dry-run` and `dist-tag` inputs. |
+
+Release flow:
+
+```bash
+npm version patch                     # or minor/major
+git push origin main --follow-tags
+gh release create vX.Y.Z --generate-notes
+```
+
+The npm trusted publisher is pinned to the `publish.yml` filename + the
+`npm-publish` GitHub environment, so renaming either breaks OIDC publishing.
 
 ## License
 
